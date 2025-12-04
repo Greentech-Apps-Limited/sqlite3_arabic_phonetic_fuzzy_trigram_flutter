@@ -40,7 +40,7 @@ class Sqlite3ArabicPhoneticFuzzyTrigramFlutter {
     } else if (Platform.isWindows) {
       return Future.value(
         DynamicLibrary.open(
-          'sqlite3_arabic_phonetic_fuzzy_trigram_flutter_plugin.dll',
+          'sqlite3-arabic-phonetic-fuzzy-trigram.dll',
         ),
       );
     } else if (Platform.isIOS || Platform.isMacOS) {

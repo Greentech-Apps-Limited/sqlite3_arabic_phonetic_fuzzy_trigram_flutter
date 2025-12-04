@@ -13,7 +13,6 @@
  * The normalized text is then indexed as a stream of 3-character trigrams,
  * providing tolerance for typos and spelling variations.
  */
-
 #ifndef ARABIC_PHONETIC_FUZZY_TRIGRAM_H
 #define ARABIC_PHONETIC_FUZZY_TRIGRAM_H
 
@@ -34,6 +33,9 @@ extern "C" {
  * @param pApi A pointer to the SQLite API routines structure.
  * @return SQLITE_OK on success, or an error code on failure.
  */
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
 int sqlite3_arabic_phonetic_fuzzy_trigram_init(
         sqlite3 *db,
         char **pzErrMsg,

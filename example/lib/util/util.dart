@@ -1,6 +1,5 @@
 import 'dart:io';
 
-@pragma("vm:platform-const")
 final bool isSupportedPlatforms = [
   'linux',
   'macos',

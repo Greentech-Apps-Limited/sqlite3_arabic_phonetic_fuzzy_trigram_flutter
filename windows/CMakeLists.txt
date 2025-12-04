@@ -16,41 +16,12 @@ cmake_policy(VERSION 3.14...3.25)
 # not be changed
 set(PLUGIN_NAME "sqlite3_arabic_phonetic_fuzzy_trigram_flutter_plugin")
 
-# Any new source files that you add to the plugin should be added here.
-list(APPEND PLUGIN_SOURCES
-        "sqlite3_arabic_phonetic_fuzzy_trigram_flutter_plugin.cpp"
-        "sqlite3_arabic_phonetic_fuzzy_trigram_flutter_plugin.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/sqlite3_arabic_phonetic_fuzzy_trigram/sqlite3.c"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/sqlite3_arabic_phonetic_fuzzy_trigram/common.c"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/sqlite3_arabic_phonetic_fuzzy_trigram/sqlite3-arabic-phonetic-fuzzy-trigram.c"
-)
+# Build sqlite3 as a separate static library
+add_library(sqlite3_lib STATIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/tokenizer/sqlite3.c"
+        )
 
-# Define the plugin library target. Its name must not be changed (see comment
-# on PLUGIN_NAME above).
-add_library(${PLUGIN_NAME} SHARED
-        "include/sqlite3_arabic_phonetic_fuzzy_trigram_flutter/sqlite3_arabic_phonetic_fuzzy_trigram_flutter_plugin_c_api.h"
-        "sqlite3_arabic_phonetic_fuzzy_trigram_flutter_plugin_c_api.cpp"
-        ${PLUGIN_SOURCES}
-)
-
-set_target_properties(${PLUGIN_NAME} PROPERTIES
-        OUTPUT_NAME "sqlite3-arabic-phonetic-fuzzy-trigram"
-)
-
-# Apply a standard set of build settings that are configured in the
-# application-level CMakeLists.txt. This can be removed for plugins that want
-# full control over build settings.
-apply_standard_settings(${PLUGIN_NAME})
-
-# Symbols are hidden by default to reduce the chance of accidental conflicts
-# between plugins. This should not be removed; any symbols that should be
-# exported should be explicitly exported with the FLUTTER_PLUGIN_EXPORT macro.
-set_target_properties(${PLUGIN_NAME} PROPERTIES
-        CXX_VISIBILITY_PRESET hidden)
-target_compile_definitions(${PLUGIN_NAME} PRIVATE FLUTTER_PLUGIN_IMPL)
-
-# SQLite compile definitions
-target_compile_definitions(${PLUGIN_NAME} PRIVATE
+target_compile_definitions(sqlite3_lib PRIVATE
         SQLITE_ENABLE_FTS3
         SQLITE_ENABLE_FTS3_PARENTHESIS
         SQLITE_ENABLE_FTS3_TOKENIZER
@@ -77,19 +48,70 @@ target_compile_definitions(${PLUGIN_NAME} PRIVATE
         SQLITE_HAVE_LOCALTIME_S
         SQLITE_HAVE_MALLOC_USABLE_SIZE
         SQLITE_HAVE_STRCHRNUL
-)
+        )
 
-# Source include directories and library dependencies. Add any plugin-specific
-# dependencies here.
+if(MSVC)
+    target_compile_options(sqlite3_lib PRIVATE
+            /W3
+            /wd4101
+            /wd4267
+            /wd4189
+            )
+endif()
+
+# Any new source files that you add to the plugin should be added here.
+list(APPEND PLUGIN_SOURCES
+        "sqlite3_arabic_phonetic_fuzzy_trigram_flutter_plugin.cpp"
+        "sqlite3_arabic_phonetic_fuzzy_trigram_flutter_plugin.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/tokenizer/sqlite3-arabic-phonetic-fuzzy-trigram.c"
+        )
+
+# Define the plugin library target. Its name must not be changed (see comment
+# on PLUGIN_NAME above).
+add_library(${PLUGIN_NAME} SHARED
+        "include/sqlite3_arabic_phonetic_fuzzy_trigram_flutter/sqlite3_arabic_phonetic_fuzzy_trigram_flutter_plugin_c_api.h"
+        "sqlite3_arabic_phonetic_fuzzy_trigram_flutter_plugin_c_api.cpp"
+        ${PLUGIN_SOURCES}
+        )
+
+set_target_properties(${PLUGIN_NAME} PROPERTIES
+        OUTPUT_NAME "sqlite3-arabic-phonetic-fuzzy-trigram"
+        )
+
+# Apply a standard set of build settings
+apply_standard_settings(${PLUGIN_NAME})
+
+# Disable warnings as errors for C code (MSVC specific)
+if(MSVC)
+    target_compile_options(${PLUGIN_NAME} PRIVATE
+            /W3
+            /wd4101
+            /wd4267
+            /wd4189
+            )
+endif()
+
+set_target_properties(${PLUGIN_NAME} PROPERTIES
+        CXX_VISIBILITY_PRESET hidden)
+target_compile_definitions(${PLUGIN_NAME} PRIVATE FLUTTER_PLUGIN_IMPL)
+
+# SQLite compile definitions
+target_compile_definitions(${PLUGIN_NAME} PRIVATE
+        SQLITE_ENABLE_FTS3
+        SQLITE_ENABLE_FTS3_PARENTHESIS
+        SQLITE_ENABLE_FTS3_TOKENIZER
+        SQLITE_ENABLE_FTS4
+        SQLITE_ENABLE_FTS5
+        SQLITE_ENABLE_RTREE
+        )
+
 target_include_directories(${PLUGIN_NAME} INTERFACE
         "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(${PLUGIN_NAME} PRIVATE flutter flutter_wrapper_plugin)
 
-# List of absolute paths to libraries that should be bundled with the plugin.
-# This list could contain prebuilt libraries, or libraries created by an
-# external build triggered from this build file.
+# Link against the static sqlite3 library
+target_link_libraries(${PLUGIN_NAME} PRIVATE flutter flutter_wrapper_plugin sqlite3_lib)
+
 set(sqlite3_arabic_phonetic_fuzzy_trigram_flutter_bundled_libraries
         ""
         PARENT_SCOPE
-)
-
+        )
