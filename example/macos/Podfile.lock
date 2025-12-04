@@ -1,0 +1,75 @@
+PODS:
+  - FlutterMacOS (1.0.0)
+  - path_provider_foundation (0.0.1):
+    - Flutter
+    - FlutterMacOS
+  - shared_preferences_foundation (0.0.1):
+    - Flutter
+    - FlutterMacOS
+  - sqflite (0.0.3):
+    - Flutter
+    - FlutterMacOS
+  - "sqlite3 (3.45.3+1)":
+    - "sqlite3/common (= 3.45.3+1)"
+  - sqlite3-arabic-phonetic-fuzzy-trigram (0.0.1)
+  - "sqlite3/common (3.45.3+1)"
+  - "sqlite3/fts (3.45.3+1)":
+    - sqlite3/common
+  - "sqlite3/fts5 (3.45.3+1)":
+    - sqlite3/common
+  - "sqlite3/perf-threadsafe (3.45.3+1)":
+    - sqlite3/common
+  - "sqlite3/rtree (3.45.3+1)":
+    - sqlite3/common
+  - sqlite3_arabic_phonetic_fuzzy_trigram_flutter (0.0.1):
+    - FlutterMacOS
+    - sqlite3-arabic-phonetic-fuzzy-trigram (= 0.0.1)
+  - sqlite3_flutter_libs (0.0.1):
+    - FlutterMacOS
+    - "sqlite3 (~> 3.45.3+1)"
+    - sqlite3/fts
+    - sqlite3/fts5
+    - sqlite3/perf-threadsafe
+    - sqlite3/rtree
+
+DEPENDENCIES:
+  - FlutterMacOS (from `Flutter/ephemeral`)
+  - path_provider_foundation (from `Flutter/ephemeral/.symlinks/plugins/path_provider_foundation/darwin`)
+  - shared_preferences_foundation (from `Flutter/ephemeral/.symlinks/plugins/shared_preferences_foundation/darwin`)
+  - sqflite (from `Flutter/ephemeral/.symlinks/plugins/sqflite/darwin`)
+  - sqlite3_arabic_phonetic_fuzzy_trigram_flutter (from `Flutter/ephemeral/.symlinks/plugins/sqlite3_arabic_phonetic_fuzzy_trigram_flutter/macos`)
+  - sqlite3_flutter_libs (from `Flutter/ephemeral/.symlinks/plugins/sqlite3_flutter_libs/macos`)
+
+SPEC REPOS:
+  https://github.com/GreentechApps/cocoapods-specs.git:
+    - sqlite3-arabic-phonetic-fuzzy-trigram
+  trunk:
+    - sqlite3
+
+EXTERNAL SOURCES:
+  FlutterMacOS:
+    :path: Flutter/ephemeral
+  path_provider_foundation:
+    :path: Flutter/ephemeral/.symlinks/plugins/path_provider_foundation/darwin
+  shared_preferences_foundation:
+    :path: Flutter/ephemeral/.symlinks/plugins/shared_preferences_foundation/darwin
+  sqflite:
+    :path: Flutter/ephemeral/.symlinks/plugins/sqflite/darwin
+  sqlite3_arabic_phonetic_fuzzy_trigram_flutter:
+    :path: Flutter/ephemeral/.symlinks/plugins/sqlite3_arabic_phonetic_fuzzy_trigram_flutter/macos
+  sqlite3_flutter_libs:
+    :path: Flutter/ephemeral/.symlinks/plugins/sqlite3_flutter_libs/macos
+
+SPEC CHECKSUMS:
+  FlutterMacOS: d0db08ddef1a9af05a5ec4b724367152bb0500b1
+  path_provider_foundation: 0b743cbb62d8e47eab856f09262bb8c1ddcfe6ba
+  shared_preferences_foundation: 5086985c1d43c5ba4d5e69a4e8083a389e2909e6
+  sqflite: 673a0e54cc04b7d6dba8d24fb8095b31c3a99eec
+  sqlite3: 02d1f07eaaa01f80a1c16b4b31dfcbb3345ee01a
+  sqlite3-arabic-phonetic-fuzzy-trigram: 77cb23a6f820d01a167338ca24a7c39b99796b6a
+  sqlite3_arabic_phonetic_fuzzy_trigram_flutter: cbe1c81be119ea281fe3ef7726f3d9936b016e6d
+  sqlite3_flutter_libs: 59300fcc5ab6368d022cc10b4928a2030494d039
+
+PODFILE CHECKSUM: 8910850149a2da494d9a292879e77c8affff4559
+
+COCOAPODS: 1.16.2
