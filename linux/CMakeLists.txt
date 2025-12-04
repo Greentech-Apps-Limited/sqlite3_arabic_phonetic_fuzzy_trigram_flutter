@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.14)
 set(PROJECT_NAME "sqlite3_arabic_phonetic_fuzzy_trigram_flutter")
-project(${PROJECT_NAME} LANGUAGES CXX)
+project(${PROJECT_NAME} LANGUAGES CXX C)
 set(PLUGIN_NAME "sqlite3_arabic_phonetic_fuzzy_trigram_flutter_plugin")
 
 
@@ -9,7 +9,6 @@ set(PLUGIN_NAME "sqlite3_arabic_phonetic_fuzzy_trigram_flutter_plugin")
 add_library(${PLUGIN_NAME} SHARED
   "sqlite3_arabic_phonetic_fuzzy_trigram_flutter_plugin.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/include/sqlite3_arabic_phonetic_fuzzy_trigram/sqlite3.c"
-  "${CMAKE_CURRENT_SOURCE_DIR}/include/sqlite3_arabic_phonetic_fuzzy_trigram/common.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/include/sqlite3_arabic_phonetic_fuzzy_trigram/sqlite3-arabic-phonetic-fuzzy-trigram.c"
 )
 
