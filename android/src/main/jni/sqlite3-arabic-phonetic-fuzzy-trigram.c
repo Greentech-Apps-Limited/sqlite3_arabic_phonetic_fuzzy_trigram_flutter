@@ -114,6 +114,7 @@ struct arabic_phonetic_fuzzy_trigram_tokenizer {
     int bRemoveDiacritics;    /* Remove Arabic diacritics */
     int bGenerateTrigrams;    /* Generate trigram tokens */
     int bTransliterate;       /* Generate transliterated tokens */
+    int bGeneratePhonetic;    /* Generate phonetic hash tokens */
     int bCaseSensitive;       /* Case sensitive tokenization */
 };
 
@@ -923,6 +924,7 @@ static int arabic_phonetic_fuzzy_trigram_create(
     pNew->bRemoveDiacritics = 1;
     pNew->bGenerateTrigrams = 1;
     pNew->bTransliterate = 1;
+    pNew->bGeneratePhonetic = 1;
     pNew->bCaseSensitive = 0;
 
     /* Parse arguments */
@@ -935,6 +937,9 @@ static int arabic_phonetic_fuzzy_trigram_create(
             i++;
         } else if (strcmp(azArg[i], "transliterate") == 0 && i + 1 < nArg) {
             pNew->bTransliterate = atoi(azArg[i + 1]);
+            i++;
+        } else if (strcmp(azArg[i], "generate_phonetic") == 0 && i + 1 < nArg) {
+            pNew->bGeneratePhonetic = atoi(azArg[i + 1]);
             i++;
         }
     }
@@ -986,9 +991,9 @@ static int arabic_phonetic_fuzzy_trigram_tokenize(
                     int clean_len;
                     char *clean = remove_diacritic(token, token_len, &clean_len);
                     if (clean && clean_len > 0) {
-                      //  printf("PRIMARY Arabic token: '%.*s' hex: ", clean_len, clean);
-                      //  for(int k = 0; k < clean_len; k++) printf("%02x ", (unsigned char)clean[k]);
-                     //   printf("\n");
+                        //  printf("PRIMARY Arabic token: '%.*s' hex: ", clean_len, clean);
+                        //  for(int k = 0; k < clean_len; k++) printf("%02x ", (unsigned char)clean[k]);
+                        //   printf("\n");
                         rc = xToken(pCtx, 0, clean, clean_len, token_start, pos);  // PRIMARY
 //                        if (rc == SQLITE_OK) {
 //                            rc = generate_phonetic_hash(clean, clean_len, pCtx, token_start, pos, xToken, 1, "remove_diacritic");
@@ -1003,8 +1008,14 @@ static int arabic_phonetic_fuzzy_trigram_tokenize(
                     }
                     if (clean) sqlite3_free(clean);
                 } else {
-                    // Non-Arabic: keep phonetic hash as primary
-                    rc = generate_phonetic_hash(token, token_len, pCtx, token_start, pos, xToken, 0, "default");
+                    // Non-Arabic: check if we should generate phonetic hash
+                    if (pTok->bGeneratePhonetic) {
+                        rc = generate_phonetic_hash(token, token_len, pCtx, token_start, pos, xToken, 0, "default");
+                    } else {
+                        // If phonetic is disabled, we MUST emit the raw token as primary,
+                        // otherwise this word is effectively lost to the index.
+                        rc = xToken(pCtx, 0, token, token_len, token_start, pos);
+                    }
                 }
 
 
@@ -1020,7 +1031,7 @@ static int arabic_phonetic_fuzzy_trigram_tokenize(
                         rc = xToken(pCtx, 1, translit, translit_len, token_start, pos);
                         //  printf("translit %s\n\n", translit);
                         /* Apply phonetic patterns to transliterated text */
-                        if (rc == SQLITE_OK) {
+                        if (rc == SQLITE_OK && pTok->bGeneratePhonetic) {
                             rc = generate_phonetic_hash(translit, translit_len, pCtx, token_start, pos, xToken,1,
                                                         "translit");
                         }
@@ -1058,9 +1069,9 @@ static int arabic_phonetic_fuzzy_trigram_tokenize(
             int clean_len;
             char *clean = remove_diacritic(token, token_len, &clean_len);
             if (clean && clean_len > 0) {
-               // printf("PRIMARY Arabic token: '%.*s' hex: ", clean_len, clean);
-             //   for(int k = 0; k < clean_len; k++) printf("%02x ", (unsigned char)clean[k]);
-            //    printf("\n");
+                // printf("PRIMARY Arabic token: '%.*s' hex: ", clean_len, clean);
+                //   for(int k = 0; k < clean_len; k++) printf("%02x ", (unsigned char)clean[k]);
+                //    printf("\n");
                 rc = xToken(pCtx, 0, clean, clean_len, token_start, pos);  // PRIMARY
 //                if (rc == SQLITE_OK) {
 //                    rc = generate_phonetic_hash(clean, clean_len, pCtx, token_start, pos, xToken, 1, "remove_diacritic");
@@ -1075,8 +1086,13 @@ static int arabic_phonetic_fuzzy_trigram_tokenize(
             }
             if (clean) sqlite3_free(clean);
         } else {
-            // Non-Arabic: keep phonetic hash as primary
-            rc = generate_phonetic_hash(token, token_len, pCtx, token_start, pos, xToken, 0, "default");
+            // Non-Arabic: check if we should generate phonetic hash
+            if (pTok->bGeneratePhonetic) {
+                rc = generate_phonetic_hash(token, token_len, pCtx, token_start, pos, xToken, 0, "default");
+            } else {
+                // Fallback to raw token
+                rc = xToken(pCtx, 0, token, token_len, token_start, pos);
+            }
         }
 
         //  printf("word '%.*s'\n\n", token_len, token);
@@ -1088,7 +1104,7 @@ static int arabic_phonetic_fuzzy_trigram_tokenize(
                 (translit_len != token_len || memcmp(token, translit, token_len) != 0)) {
                 rc = xToken(pCtx, 1, translit, translit_len, token_start, pos);
                 // printf("translit %s\n\n", translit);
-                if (rc == SQLITE_OK) {
+                if (rc == SQLITE_OK && pTok->bGeneratePhonetic) {
                     rc = generate_phonetic_hash(translit, translit_len, pCtx, token_start, pos, xToken,1, "translit");
                 }
                 if (rc == SQLITE_OK && pTok->bGenerateTrigrams) {
