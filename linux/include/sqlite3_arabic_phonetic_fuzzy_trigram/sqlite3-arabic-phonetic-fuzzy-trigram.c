@@ -312,6 +312,18 @@ static int is_arabic_char(int codepoint) {
 }
 
 /*
+** Convert ASCII characters to lowercase in-place
+** Only affects A-Z, leaves other characters unchanged
+*/
+static void lowercase_ascii(char *str, int len) {
+    for (int i = 0; i < len; i++) {
+        if (str[i] >= 'A' && str[i] <= 'Z') {
+            str[i] = str[i] + 32;  // Convert uppercase to lowercase
+        }
+    }
+}
+
+/*
 ** Check if a word is Arabic by checking the first character
 ** Returns 1 if the first character is Arabic, 0 otherwise
 */
@@ -875,13 +887,30 @@ static int emit_trigrams_arabic(const char *word, int word_len,
 */
 static int generate_phonetic_hash(const char *word, int word_len,
                                   void *pCtx, int start, int end,
-                                  int (*xToken)(void *, int, const char *, int, int, int), int flags, char *text) {
+                                  int (*xToken)(void *, int, const char *, int, int, int),
+                                  int flags, char *text, int case_sensitive) {
     int rc = SQLITE_OK;
 
-    unsigned char *generated_hash = phonetic_hash((const unsigned char *) word, word_len);
+    // Lowercase the word before generating hash if case-insensitive
+    char *input_word = (char *)word;
+    char *lowered = NULL;
+
+    if (!case_sensitive) {
+        lowered = sqlite3_malloc(word_len + 1);
+        if (lowered) {
+            memcpy(lowered, word, word_len);
+            lowered[word_len] = '\0';
+            lowercase_ascii(lowered, word_len);
+            input_word = lowered;
+        }
+    }
+
+    unsigned char *generated_hash = phonetic_hash((const unsigned char *)input_word, word_len);
+
+    if (lowered) sqlite3_free(lowered);
 
     if (generated_hash == NULL) {
-        return SQLITE_IOERR_NOMEM; // Error: memory allocation failed
+        return SQLITE_IOERR_NOMEM;
     }
 
     // Calculate the length of the generated hash
@@ -889,7 +918,6 @@ static int generate_phonetic_hash(const char *word, int word_len,
 
     // Call the xToken function with the generated hash
     int result = xToken(pCtx, flags, (const char *) generated_hash, hash_length, start, end);
-    // printf("generated hash '%s' '%.*s' %s\n\n", generated_hash, word_len, word, text);
 
     // Clean up allocated memory
     sqlite3_free(generated_hash);
@@ -941,6 +969,9 @@ static int arabic_phonetic_fuzzy_trigram_create(
             i++;
         } else if (strcmp(azArg[i], "generate_phonetic") == 0 && i + 1 < nArg) {
             pNew->bGeneratePhonetic = atoi(azArg[i + 1]);
+            i++;
+        } else if (strcmp(azArg[i], "case_sensitive") == 0 && i + 1 < nArg) {
+            pNew->bCaseSensitive = atoi(azArg[i + 1]);
             i++;
         }
     }
@@ -1011,11 +1042,25 @@ static int arabic_phonetic_fuzzy_trigram_tokenize(
                 } else {
                     // Non-Arabic: check if we should generate phonetic hash
                     if (pTok->bGeneratePhonetic) {
-                        rc = generate_phonetic_hash(token, token_len, pCtx, token_start, pos, xToken, 0, "default");
+                        rc = generate_phonetic_hash(token, token_len, pCtx, token_start, pos, xToken, 0, "default", pTok->bCaseSensitive);
                     } else {
-                        // If phonetic is disabled, we MUST emit the raw token as primary,
-                        // otherwise this word is effectively lost to the index.
-                        rc = xToken(pCtx, 0, token, token_len, token_start, pos);
+                        // If phonetic is disabled, emit the raw token as primary
+                        if (!pTok->bCaseSensitive) {
+                            // Lowercase for case-insensitive matching
+                            char *lowered = sqlite3_malloc(token_len + 1);
+                            if (lowered) {
+                                memcpy(lowered, token, token_len);
+                                lowered[token_len] = '\0';
+                                lowercase_ascii(lowered, token_len);
+                                rc = xToken(pCtx, 0, lowered, token_len, token_start, pos);
+                                sqlite3_free(lowered);
+                            } else {
+                                rc = SQLITE_NOMEM;
+                            }
+                        } else {
+                            // Case-sensitive: emit as-is
+                            rc = xToken(pCtx, 0, token, token_len, token_start, pos);
+                        }
                     }
                 }
 
@@ -1023,18 +1068,25 @@ static int arabic_phonetic_fuzzy_trigram_tokenize(
 
                 //  printf("word '%.*s'\n\n", token_len, token);
                 /* Transliterate if enabled */
+                /* Transliterate if enabled */
                 if (rc == SQLITE_OK && pTok->bTransliterate &&
                     (!is_arabic_word(token, token_len) || has_diacritics(token, token_len))) {
                     int translit_len;
                     char *translit = transliterate_text(token, token_len, &translit_len);
                     if (translit && translit_len > 0 &&
                         (translit_len != token_len || memcmp(token, translit, token_len) != 0)) {
+
+                        // Lowercase transliterated text if case-insensitive
+                        if (!pTok->bCaseSensitive) {
+                            lowercase_ascii(translit, translit_len);
+                        }
+
                         rc = xToken(pCtx, 1, translit, translit_len, token_start, pos);
-                        //  printf("translit %s\n\n", translit);
+
                         /* Apply phonetic patterns to transliterated text */
                         if (rc == SQLITE_OK && pTok->bGeneratePhonetic) {
-                            rc = generate_phonetic_hash(translit, translit_len, pCtx, token_start, pos, xToken,1,
-                                                        "translit");
+                            rc = generate_phonetic_hash(translit, translit_len, pCtx, token_start, pos, xToken, 1,
+                                                        "translit", pTok->bCaseSensitive);
                         }
 
                         /* Generate trigrams for transliterated text */
@@ -1089,25 +1141,51 @@ static int arabic_phonetic_fuzzy_trigram_tokenize(
         } else {
             // Non-Arabic: check if we should generate phonetic hash
             if (pTok->bGeneratePhonetic) {
-                rc = generate_phonetic_hash(token, token_len, pCtx, token_start, pos, xToken, 0, "default");
+                rc = generate_phonetic_hash(token, token_len, pCtx, token_start, pos, xToken, 0, "default", pTok->bCaseSensitive);
             } else {
-                // Fallback to raw token
-                rc = xToken(pCtx, 0, token, token_len, token_start, pos);
+                // If phonetic is disabled, emit the raw token as primary
+                if (!pTok->bCaseSensitive) {
+                    // Lowercase for case-insensitive matching
+                    char *lowered = sqlite3_malloc(token_len + 1);
+                    if (lowered) {
+                        memcpy(lowered, token, token_len);
+                        lowered[token_len] = '\0';
+                        lowercase_ascii(lowered, token_len);
+                        rc = xToken(pCtx, 0, lowered, token_len, token_start, pos);
+                        sqlite3_free(lowered);
+                    } else {
+                        rc = SQLITE_NOMEM;
+                    }
+                } else {
+                    // Case-sensitive: emit as-is
+                    rc = xToken(pCtx, 0, token, token_len, token_start, pos);
+                }
             }
         }
 
         //  printf("word '%.*s'\n\n", token_len, token);
+        /* Transliterate if enabled */
         if (rc == SQLITE_OK && pTok->bTransliterate &&
             (!is_arabic_word(token, token_len) || has_diacritics(token, token_len))) {
             int translit_len;
             char *translit = transliterate_text(token, token_len, &translit_len);
             if (translit && translit_len > 0 &&
                 (translit_len != token_len || memcmp(token, translit, token_len) != 0)) {
-                rc = xToken(pCtx, 1, translit, translit_len, token_start, pos);
-                // printf("translit %s\n\n", translit);
-                if (rc == SQLITE_OK && pTok->bGeneratePhonetic) {
-                    rc = generate_phonetic_hash(translit, translit_len, pCtx, token_start, pos, xToken,1, "translit");
+
+                // Lowercase transliterated text if case-insensitive
+                if (!pTok->bCaseSensitive) {
+                    lowercase_ascii(translit, translit_len);
                 }
+
+                rc = xToken(pCtx, 1, translit, translit_len, token_start, pos);
+
+                /* Apply phonetic patterns to transliterated text */
+                if (rc == SQLITE_OK && pTok->bGeneratePhonetic) {
+                    rc = generate_phonetic_hash(translit, translit_len, pCtx, token_start, pos, xToken, 1,
+                                                "translit", pTok->bCaseSensitive);
+                }
+
+                /* Generate trigrams for transliterated text */
                 if (rc == SQLITE_OK && pTok->bGenerateTrigrams) {
                     rc = emit_trigrams(translit, translit_len, pCtx, token_start, pos, xToken);
                 }

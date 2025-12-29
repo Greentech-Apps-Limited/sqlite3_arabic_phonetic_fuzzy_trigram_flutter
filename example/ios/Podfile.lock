@@ -13,7 +13,7 @@ PODS:
     - FlutterMacOS
   - "sqlite3 (3.45.3+1)":
     - "sqlite3/common (= 3.45.3+1)"
-  - sqlite3-arabic-phonetic-fuzzy-trigram (0.0.2)
+  - sqlite3-arabic-phonetic-fuzzy-trigram (0.0.3)
   - "sqlite3/common (3.45.3+1)"
   - "sqlite3/fts (3.45.3+1)":
     - sqlite3/common
@@ -25,7 +25,7 @@ PODS:
     - sqlite3/common
   - sqlite3_arabic_phonetic_fuzzy_trigram_flutter (0.0.1):
     - Flutter
-    - sqlite3-arabic-phonetic-fuzzy-trigram (= 0.0.2)
+    - sqlite3-arabic-phonetic-fuzzy-trigram (= 0.0.3)
   - sqlite3_flutter_libs (0.0.1):
     - Flutter
     - "sqlite3 (~> 3.45.3+1)"
@@ -72,8 +72,8 @@ SPEC CHECKSUMS:
   shared_preferences_foundation: 5086985c1d43c5ba4d5e69a4e8083a389e2909e6
   sqflite: 673a0e54cc04b7d6dba8d24fb8095b31c3a99eec
   sqlite3: 02d1f07eaaa01f80a1c16b4b31dfcbb3345ee01a
-  sqlite3-arabic-phonetic-fuzzy-trigram: 4a5fe5265f4db5d3b8a4c8fc5149a4ed2cc8802f
-  sqlite3_arabic_phonetic_fuzzy_trigram_flutter: 14f9800cb7a90dd2ae8dc76fc41a9987bdae7364
+  sqlite3-arabic-phonetic-fuzzy-trigram: 01e028a0a622408204b087153a6162c43ad0424b
+  sqlite3_arabic_phonetic_fuzzy_trigram_flutter: 6a485133751ceabb1ebfd7bbb10bbef2af5a6b09
   sqlite3_flutter_libs: ec169f6ca885dd05867a985d1c9d5805cf71673d
 
 PODFILE CHECKSUM: c5d1f1ffc8059cede02e2dab414163bb4849d7d9

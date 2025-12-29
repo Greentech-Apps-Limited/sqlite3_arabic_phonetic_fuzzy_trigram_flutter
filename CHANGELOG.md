@@ -5,3 +5,7 @@
 ## 0.0.2
 
 * Added phonetic search enable & disable feature
+
+## 0.0.3
+
+* Implement case sensitive & case insensitive

@@ -23,7 +23,7 @@ SQLite FTS5 Arabic Phonetic Fuzzy Trigram Tokenizer
   # s.resource_bundles = {'sqlite3_arabic_phonetic_fuzzy_trigram_flutter_privacy' => ['Resources/PrivacyInfo.xcprivacy']}
 
   s.dependency 'FlutterMacOS'
-  s.dependency 'sqlite3-arabic-phonetic-fuzzy-trigram', '0.0.2'
+  s.dependency 'sqlite3-arabic-phonetic-fuzzy-trigram', '0.0.3'
 
   s.platform = :osx, '10.13'
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }

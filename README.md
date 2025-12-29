@@ -38,7 +38,7 @@ First, add `sqlite3_arabic_phonetic_fuzzy_trigram_flutter` as a dependency in yo
 
 ```yaml
 dependencies:
-  sqlite3_arabic_phonetic_fuzzy_trigram_flutter: ^0.0.2
+  sqlite3_arabic_phonetic_fuzzy_trigram_flutter: ^0.0.3
 ```
 
 The add this in `ios/Podfile` & `macos/Podfile`
