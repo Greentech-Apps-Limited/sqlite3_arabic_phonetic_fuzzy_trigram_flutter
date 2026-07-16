@@ -1,6 +1,6 @@
 name: sqlite3_arabic_phonetic_fuzzy_trigram_flutter
 description: "SQLite FTS5 Arabic Phonetic Fuzzy Trigram Tokenizer"
-version: 0.0.3
+version: 0.2.0
 homepage: https://github.com/Greentech-Apps-Limited/sqlite3_arabic_phonetic_fuzzy_trigram_flutter
 
 environment:

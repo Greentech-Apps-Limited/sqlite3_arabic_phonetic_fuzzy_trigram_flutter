@@ -15,7 +15,7 @@ SQLite FTS5 Arabic Phonetic Fuzzy Trigram Tokenizer
   s.source           = { :path => '.' }
   s.source_files = 'Classes/**/*'
   s.dependency 'Flutter'
-  s.dependency 'sqlite3-arabic-phonetic-fuzzy-trigram', '0.0.3'
+  s.dependency 'sqlite3-arabic-phonetic-fuzzy-trigram', '0.2.0'
   s.platform = :ios, '14.0'
 
   # Flutter.framework does not contain a i386 slice.

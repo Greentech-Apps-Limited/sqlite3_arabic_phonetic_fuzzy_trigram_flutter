@@ -1,104 +1,58 @@
 /*
-** SQLite FTS5 Arabic Tokenizer with Transliteration and Better Trigram Support
+** SQLite FTS5 Arabic Tokenizer with Transliteration and Fuzzy Matching
 **
 ** Based on GreentechApps/sqlite3-arabic-tokenizer approach
-** Combined with streetwriters/sqlite-better-trigram and nalgeon/sqlean translit
+** Combined with streetwriters/sqlite-better-trigram
+**
+** Version 0.1.0 — token-format revision (see README):
+**   * The primary token (flags=0) is always the literal word:
+**       Arabic  -> diacritic-stripped word (unchanged from 0.0.x)
+**       other   -> ASCII-lowercased word   (unchanged from 0.0.x)
+**   * All fuzzy tokens are emitted as FTS5 colocated synonyms (flags=1):
+**       Arabic       -> character trigrams (unchanged) + transliteration
+**                       + normalized transliteration
+**       ASCII/Latin  -> normalized form (see normalize_latin_ascii)
+**       CJK          -> character bigrams + trigrams
+**       other script -> character trigrams
+**   * transliterate no longer requires diacritics: every Arabic word emits
+**     its transliteration when enabled.
+**   * CJK punctuation and fullwidth punctuation are word separators.
+**   * generate_phonetic (spellfix hash) is retired: the argument is accepted
+**     and ignored for schema compatibility. It collided 41-76% of the Latin
+**     vocabulary per language (e.g. "sayyiban" == "subhan"), producing
+**     unrelated search results. normalize_latin_ascii replaces it (1-9%).
+**
+** Arguments (all optional, shown with defaults):
+**   remove_diacritics 1    strip Arabic diacritics; normalize alif/yeh/teh
+**   generate_trigrams 1    colocated char n-grams (Arabic/Indic: 3; CJK: 2+3)
+**   transliterate 1        colocated Latin transliteration of Arabic words
+**   generate_normalized 1  colocated normalized Latin token
+**   case_sensitive 0       keep ASCII case (fuzzy tokens are always lowered)
+**   generate_phonetic -    DEPRECATED, ignored
 */
 
 #include "sqlite3ext.h"
 
 SQLITE_EXTENSION_INIT1
 
-#include <stdio.h>
+/* Reported by SELECT arabic_phonetic_fuzzy_trigram_version().
+** Bump on ANY change to token output — the backend index and the on-device
+** queries must be produced by the same token format. */
+#define ARABIC_PHONETIC_FUZZY_TRIGRAM_VERSION "0.2.0"
+
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 #include <ctype.h>
-#include "common.c"
 
-
-// Ooriginally from the spellfix SQLite exension, Public Domain
-// https://www.sqlite.org/src/file/ext/misc/spellfix.c
-// Modified by Anton Zhiyanov, https://github.com/nalgeon/sqlean/, MIT License
-
-extern const unsigned char midClass[];
-extern const unsigned char initClass[];
-extern const unsigned char className[];
-
-/*
-** Generate a "phonetic hash" from a string of ASCII characters
-** in zIn[0..nIn-1].
-**
-**   * Map characters by character class as defined above.
-**   * Omit double-letters
-**   * Omit vowels beside R and L
-**   * Omit T when followed by CH
-**   * Omit W when followed by R
-**   * Omit D when followed by J or G
-**   * Omit K in KN or G in GN at the beginning of a word
-**
-** Space to hold the result is obtained from sqlite3_malloc()
-**
-** Return NULL if memory allocation fails.
-*/
-unsigned char *phonetic_hash(const unsigned char *zIn, int nIn) {
-    unsigned char *zOut = sqlite3_malloc(nIn + 1);
-    int i;
-    int nOut = 0;
-    char cPrev = 0x77;
-    char cPrevX = 0x77;
-    const unsigned char *aClass = initClass;
-
-    if (zOut == 0)
-        return 0;
-    if (nIn > 2) {
-        switch (zIn[0]) {
-            case 'g':
-            case 'k': {
-                if (zIn[1] == 'n') {
-                    zIn++;
-                    nIn--;
-                }
-                break;
-            }
-        }
-    }
-    for (i = 0; i < nIn; i++) {
-        unsigned char c = zIn[i];
-        if (i + 1 < nIn) {
-            if (c == 'w' && zIn[i + 1] == 'r')
-                continue;
-            if (c == 'd' && (zIn[i + 1] == 'j' || zIn[i + 1] == 'g'))
-                continue;
-            if (i + 2 < nIn) {
-                if (c == 't' && zIn[i + 1] == 'c' && zIn[i + 2] == 'h')
-                    continue;
-            }
-        }
-        c = aClass[c & 0x7f];
-        if (c == CCLASS_SPACE)
-            continue;
-        if (c == CCLASS_OTHER && cPrev != CCLASS_DIGIT)
-            continue;
-        aClass = midClass;
-        if (c == CCLASS_VOWEL && (cPrevX == CCLASS_R || cPrevX == CCLASS_L)) {
-            continue; /* No vowels beside L or R */
-        }
-        if ((c == CCLASS_R || c == CCLASS_L) && cPrevX == CCLASS_VOWEL) {
-            nOut--; /* No vowels beside L or R */
-        }
-        cPrev = c;
-        if (c == CCLASS_SILENT)
-            continue;
-        cPrevX = c;
-        c = className[c];
-        assert(nOut >= 0);
-        if (nOut == 0 || c != zOut[nOut - 1])
-            zOut[nOut++] = c;
-    }
-    zOut[nOut] = 0;
-    return zOut;
-}
+/* FTS5 tokenize-reason flags (mirrors fts5.h; defined here so the amalgamation
+** headers alone are enough to build). Currently informational only — emission
+** is symmetric for documents and queries. */
+#ifndef FTS5_TOKENIZE_QUERY
+#define FTS5_TOKENIZE_QUERY 0x0001
+#endif
+#ifndef FTS5_TOKEN_COLOCATED
+#define FTS5_TOKEN_COLOCATED 0x0001
+#endif
 
 /* Forward declarations */
 typedef struct fts5_api fts5_api;
@@ -112,176 +66,89 @@ typedef struct arabic_phonetic_fuzzy_trigram_tokenizer arabic_phonetic_fuzzy_tri
 */
 struct arabic_phonetic_fuzzy_trigram_tokenizer {
     int bRemoveDiacritics;    /* Remove Arabic diacritics */
-    int bGenerateTrigrams;    /* Generate trigram tokens */
-    int bTransliterate;       /* Generate transliterated tokens */
-    int bGeneratePhonetic;    /* Generate phonetic hash tokens */
-    int bCaseSensitive;       /* Case sensitive tokenization */
+    int bGenerateTrigrams;    /* Generate colocated char n-gram tokens */
+    int bTransliterate;       /* Generate colocated transliterated tokens */
+    int bGenerateNormalized;  /* Generate colocated normalized Latin tokens */
+    int bCaseSensitive;       /* Case sensitive primary tokens */
 };
 
-typedef unsigned char utf8_t;
+static char *aliff = "ا";
+static char *r1 = "ى";
+static char *r2 = "ئ";
+static char *r3 = "ة";
 
-#define isunicode(c) (((c)&0xc0)==0xc0)
-
-static int arabic_unicode[67] = {
-        1548, // arabic comma
-        1552,
-        1553,
-        1554,
-        1555,
-        1556,
-        1557,
-        1558,
-        1559,
-        1560,
-        1561,
-        1562,
-        1750,
-        1751,
-        1752,
-        1753,
-        1754,
-        1755,
-        1756,
-        1757,
-        1758,
-        1759,
-        1760,
-        1761,
-        1762,
-        1763,
-        1764,
-        1765,
-        1766,
-        1767,
-        1768,
-        1769,
-        1770,
-        1771,
-        1772,
-        1773,
-        1600,
-        1611,
-        1612,
-        1613,
-        1614,
-        1615,
-        1616,
-        1617,
-        1618,
-        1619,
-        1620,
-        1621,
-        1622,
-        1623,
-        1624,
-        1625,
-        1626,
-        1627,
-        1628,
-        1629,
-        1630,
-        1631,
-        1648, // 59
-
-        1571, 1573, 1570, 1649, 1671, // 64 alif replace
-        1610,
-        1569,
-        1607, // 67
-};
-
-char *aliff = "ا";
-char *r1 = "ى";
-char *r2 = "ئ";
-char *r3 = "ة";
-
-int unicode_diacritic(int code) {
-
-    int found = -1;
-    for (int i = 0; i < 67; i++) {
-        if (arabic_unicode[i] == code) {
-            found = i;
-            break;
-        }
-    }
-
-    return found;
-}
-
-int utf8_decode(const char *str, int *i) {
-    const utf8_t *s = (const utf8_t *) str; // Use unsigned chars
-    int u = *s, l = 1;
-    if (isunicode(u)) {
-        int a = (u & 0x20) ? ((u & 0x10) ? ((u & 0x08) ? ((u & 0x04) ? 6 : 5) : 4) : 3) : 2;
-        if (a < 6 || !(u & 0x02)) {
-            int b, p = 0;
-            u = ((u << (a + 1)) & 0xff) >> (a + 1);
-            for (b = 1; b < a; ++b)
-                u = (u << 6) | (s[l++] & 0x3f);
-        }
-    }
-    if (i) *i += l;
-    return u;
-}
-
-static int has_diacritics(const char *text, int text_len) {
-    int i = 0;
-    while (i < text_len) {
-        if (isunicode(text[i])) {
-            int l = 0;
-            int z = utf8_decode(&text[i], &l);
-            if (unicode_diacritic(z) != -1 && unicode_diacritic(z) < 59) {
-                return 1;
-            }
-            i += l;
-        } else {
-            i++;
-        }
-    }
-    return 0;
+/*
+** Classify an Arabic codepoint for remove_diacritic().
+** Return values keep the semantics of the historical 67-entry index table
+** (replaced by range checks — this runs for every codepoint of every
+** Arabic word, including during on-device FTS rebuilds):
+**   -1      no replacement (copy through)
+**   < 59    diacritic (strip)
+**   59..63  alif variant  -> ا
+**   64      yeh           -> ى
+**   65      hamza         -> ئ
+**   66      heh           -> ة
+*/
+static int unicode_diacritic(int c) {
+    if (c == 1548) return 0;                 /* arabic comma */
+    if (c >= 1552 && c <= 1562) return 1;    /* small high signs */
+    if (c >= 1750 && c <= 1773) return 12;   /* quranic annotation signs */
+    if (c == 1600) return 36;                /* tatweel */
+    if (c >= 1611 && c <= 1631) return 37;   /* tashkeel */
+    if (c == 1648) return 58;                /* superscript alef */
+    if (c == 1570 || c == 1571 || c == 1573 || c == 1649 || c == 1671) return 59;
+    if (c == 1610) return 64;                /* yeh */
+    if (c == 1569) return 65;                /* hamza */
+    if (c == 1607) return 66;                /* heh */
+    return -1;
 }
 
 /*
-** Improved UTF-8 codepoint extraction
-** More robust error handling
+** UTF-8 codepoint extraction, bounds-safe.
+**
+** max_bytes is the number of bytes remaining in the buffer from `text`.
+** The function never reads past text[max_bytes-1] — a truncated multibyte
+** sequence at the end of a value is reported as invalid (-1, consume 1)
+** instead of over-reading. On invalid input *bytes_consumed is 1 so callers
+** always make progress.
 */
-static int get_unicode_codepoint(const char *text, int *bytes_consumed) {
+static int get_unicode_codepoint(const char *text, int max_bytes, int *bytes_consumed) {
     const unsigned char *utf8 = (const unsigned char *) text;
     int codepoint = 0;
+
+    *bytes_consumed = 1;
+    if (max_bytes <= 0) return -1;
 
     /* Single byte ASCII */
     if ((utf8[0] & 0x80) == 0) {
         codepoint = utf8[0];
-        *bytes_consumed = 1;
     }
         /* Two byte sequence (110xxxxx 10xxxxxx) */
     else if ((utf8[0] & 0xE0) == 0xC0) {
-        if ((utf8[1] & 0xC0) != 0x80) {
-            *bytes_consumed = 1;
-            return -1; /* Invalid sequence */
+        if (max_bytes < 2 || (utf8[1] & 0xC0) != 0x80) {
+            return -1; /* Invalid or truncated sequence */
         }
         codepoint = ((utf8[0] & 0x1F) << 6) | (utf8[1] & 0x3F);
         *bytes_consumed = 2;
     }
         /* Three byte sequence (1110xxxx 10xxxxxx 10xxxxxx) */
     else if ((utf8[0] & 0xF0) == 0xE0) {
-        if ((utf8[1] & 0xC0) != 0x80 || (utf8[2] & 0xC0) != 0x80) {
-            *bytes_consumed = 1;
-            return -1; /* Invalid sequence */
+        if (max_bytes < 3 || (utf8[1] & 0xC0) != 0x80 || (utf8[2] & 0xC0) != 0x80) {
+            return -1; /* Invalid or truncated sequence */
         }
         codepoint = ((utf8[0] & 0x0F) << 12) | ((utf8[1] & 0x3F) << 6) | (utf8[2] & 0x3F);
         *bytes_consumed = 3;
     }
         /* Four byte sequence (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx) */
     else if ((utf8[0] & 0xF8) == 0xF0) {
-        if ((utf8[1] & 0xC0) != 0x80 || (utf8[2] & 0xC0) != 0x80 || (utf8[3] & 0xC0) != 0x80) {
-            *bytes_consumed = 1;
-            return -1; /* Invalid sequence */
+        if (max_bytes < 4 || (utf8[1] & 0xC0) != 0x80 || (utf8[2] & 0xC0) != 0x80 ||
+            (utf8[3] & 0xC0) != 0x80) {
+            return -1; /* Invalid or truncated sequence */
         }
         codepoint = ((utf8[0] & 0x07) << 18) | ((utf8[1] & 0x3F) << 12) |
                     ((utf8[2] & 0x3F) << 6) | (utf8[3] & 0x3F);
         *bytes_consumed = 4;
     } else {
-        *bytes_consumed = 1;
         return -1; /* Invalid UTF-8 start byte */
     }
 
@@ -291,6 +158,7 @@ static int get_unicode_codepoint(const char *text, int *bytes_consumed) {
         (*bytes_consumed == 4 && codepoint < 0x10000) ||
         codepoint > 0x10FFFF ||
         (codepoint >= 0xD800 && codepoint <= 0xDFFF)) {
+        *bytes_consumed = 1;
         return -1; /* Invalid codepoint */
     }
 
@@ -308,6 +176,18 @@ static int is_arabic_char(int codepoint) {
             (codepoint >= 0x08A0 && codepoint <= 0x08FF) ||  /* Arabic Extended-A */
             (codepoint >= 0xFB50 && codepoint <= 0xFDFF) ||  /* Arabic Presentation Forms-A */
             (codepoint >= 0xFE70 && codepoint <= 0xFEFF));   /* Arabic Presentation Forms-B */
+}
+
+/*
+** Check if a codepoint belongs to a CJK script (Han, Kana).
+** CJK text has no word separators, so it needs bigram indexing:
+** most Chinese words are two characters.
+*/
+static int is_cjk_char(int codepoint) {
+    return ((codepoint >= 0x3040 && codepoint <= 0x30FF) ||  /* Hiragana + Katakana */
+            (codepoint >= 0x3400 && codepoint <= 0x4DBF) ||  /* CJK Extension A */
+            (codepoint >= 0x4E00 && codepoint <= 0x9FFF) ||  /* CJK Unified */
+            (codepoint >= 0xF900 && codepoint <= 0xFAFF));   /* CJK Compatibility */
 }
 
 /*
@@ -332,7 +212,7 @@ static int is_arabic_word(const char *text, int text_len) {
     }
 
     int bytes_consumed;
-    int first_codepoint = get_unicode_codepoint(text, &bytes_consumed);
+    int first_codepoint = get_unicode_codepoint(text, text_len, &bytes_consumed);
 
     if (first_codepoint == -1) {
         return 0;
@@ -341,7 +221,25 @@ static int is_arabic_word(const char *text, int text_len) {
     return is_arabic_char(first_codepoint);
 }
 
-char *remove_diacritic(const char *text, int input_len, int *output_len) {
+static int is_all_ascii(const char *text, int text_len) {
+    for (int i = 0; i < text_len; i++) {
+        if ((unsigned char) text[i] & 0x80) return 0;
+    }
+    return 1;
+}
+
+static int contains_cjk(const char *text, int text_len) {
+    int pos = 0;
+    while (pos < text_len) {
+        int bytes;
+        int cp = get_unicode_codepoint(text + pos, text_len - pos, &bytes);
+        if (cp != -1 && is_cjk_char(cp)) return 1;
+        pos += (bytes > 0) ? bytes : 1;
+    }
+    return 0;
+}
+
+static char *remove_diacritic(const char *text, int input_len, int *output_len) {
     if (!text || input_len <= 0) {
         *output_len = 0;
         return NULL;
@@ -357,43 +255,39 @@ char *remove_diacritic(const char *text, int input_len, int *output_len) {
     int i = 0;
 
     while (i < input_len) {
-        if (!isunicode(text[i])) {
+        int l;
+        int z = get_unicode_codepoint(text + i, input_len - i, &l);
+
+        if (z < 0) {
+            /* Invalid/truncated byte: copy through, keep making progress */
             replaced[j++] = text[i];
             i++;
-        } else {
-            int l = 0;
-            int z = utf8_decode(&text[i], &l);
-
-            // Make sure we don't go beyond input_len
-            if (i + l > input_len) {
-                break;
-            }
-
-            i += l;
-            int index = unicode_diacritic(z);
-
-            if (index == -1) {
-                // Copy the original UTF-8 bytes
-                for (int k = 0; k < l && j < input_len + 4; k++) {
-                    replaced[j++] = text[i - l + k];
-                }
-            } else if (index >= 59 && index <= 63) {
-                replaced[j++] = aliff[0];
-                replaced[j++] = aliff[1];
-            } else if (index >= 64 && index <= 66) {
-                if (index == 64) {
-                    replaced[j++] = r1[0];
-                    replaced[j++] = r1[1];
-                } else if (index == 65) {
-                    replaced[j++] = r2[0];
-                    replaced[j++] = r2[1];
-                } else if (index == 66) {
-                    replaced[j++] = r3[0];
-                    replaced[j++] = r3[1];
-                }
-            }
-            // If index is something else (diacritic), skip it (don't add to output)
+            continue;
         }
+
+        /* Every replaceable codepoint is >= U+0600; skip the classifier
+        ** entirely for ASCII and Latin. */
+        int index = (z >= 0x0600) ? unicode_diacritic(z) : -1;
+
+        if (index == -1) {
+            for (int k = 0; k < l; k++) {
+                replaced[j++] = text[i + k];
+            }
+        } else if (index >= 59 && index <= 63) {
+            replaced[j++] = aliff[0];
+            replaced[j++] = aliff[1];
+        } else if (index == 64) {
+            replaced[j++] = r1[0];
+            replaced[j++] = r1[1];
+        } else if (index == 65) {
+            replaced[j++] = r2[0];
+            replaced[j++] = r2[1];
+        } else if (index == 66) {
+            replaced[j++] = r3[0];
+            replaced[j++] = r3[1];
+        }
+        /* index < 59: diacritic, skip (don't add to output) */
+        i += l;
     }
 
     replaced[j] = '\0';
@@ -401,10 +295,13 @@ char *remove_diacritic(const char *text, int input_len, int *output_len) {
     return replaced;
 }
 
-static struct {
+typedef struct translit_pair {
     int unicode;
     const char *ascii;
-} arabic_translit_table[] = {
+} translit_pair;
+
+/* Sorted by codepoint — looked up via translit_lookup() binary search. */
+static const translit_pair arabic_translit_table[] = {
         /* Arabic letters */
         {0x0621, ""},     /* HAMZA ء */
         {0x0622, "aa"},   /* ALEF_WITH_MADDA_ABOVE آ */
@@ -451,8 +348,39 @@ static struct {
         {0x0651, ""},     /* SHADDA ّ - handled separately */
         {0x0652, ""},     /* SUKUN ْ */
         {0x0671, "a"},    /* ALEF_WASLA ٱ */
+        /* Persian / Urdu letters (fa, ps, ur content and keyboards) */
+        {0x067E, "p"},    /* PEH پ */
+        {0x0686, "ch"},   /* TCHEH چ */
+        {0x0698, "zh"},   /* JEH ژ */
+        {0x06A9, "k"},    /* KEHEH ک */
+        {0x06AF, "g"},    /* GAF گ */
+        {0x06BA, "n"},    /* NOON GHUNNA ں */
+        {0x06BE, "h"},    /* HEH DOACHASHMEE ھ */
+        {0x06C1, "h"},    /* HEH GOAL ہ */
+        {0x06C3, "h"},    /* TEH MARBUTA GOAL ۃ */
+        {0x06CC, "y"},    /* FARSI YEH ی */
+        {0x06D2, "e"},    /* YEH BARREE ے */
         {0,      NULL}
 };
+
+/* Number of real entries in a translit table (excluding the {0, NULL} end). */
+#define TRANSLIT_COUNT(tab) ((int) (sizeof(tab) / sizeof((tab)[0]) - 1))
+
+/*
+** Binary search over a codepoint-sorted translit table.
+** Replaces per-character linear scans (the Latin table has ~190 entries and
+** runs for every character during DB generation and on-device FTS rebuilds).
+*/
+static const char *translit_lookup(const translit_pair *tab, int n, int cp) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (tab[mid].unicode == cp) return tab[mid].ascii;
+        if (tab[mid].unicode < cp) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return NULL;
+}
 
 
 static char *transliterate_arabic_text(const char *input, int input_len, int *output_len) {
@@ -468,7 +396,7 @@ static char *transliterate_arabic_text(const char *input, int input_len, int *ou
 
     while (input_pos < input_len) {
         int bytes_consumed;
-        int codepoint = get_unicode_codepoint(input + input_pos, &bytes_consumed);
+        int codepoint = get_unicode_codepoint(input + input_pos, input_len - input_pos, &bytes_consumed);
 
         if (codepoint == -1) {
             input_pos++;
@@ -485,16 +413,14 @@ static char *transliterate_arabic_text(const char *input, int input_len, int *ou
 
         /* Handle shadda (gemination) - double previous consonant */
         if (codepoint == 0x0651 && prev_codepoint != 0) { /* ّ */
-            int i;
-            for (i = 0; arabic_translit_table[i].ascii != NULL; i++) {
-                if (arabic_translit_table[i].unicode == prev_codepoint) {
-                    const char *translit = arabic_translit_table[i].ascii;
-                    int len = strlen(translit);
-                    if (output_pos + len < input_len * 4) {
-                        memcpy(output + output_pos, translit, len);
-                        output_pos += len;
-                    }
-                    break;
+            const char *geminate = translit_lookup(
+                    arabic_translit_table, TRANSLIT_COUNT(arabic_translit_table),
+                    prev_codepoint);
+            if (geminate) {
+                int len = strlen(geminate);
+                if (output_pos + len < input_len * 4) {
+                    memcpy(output + output_pos, geminate, len);
+                    output_pos += len;
                 }
             }
             input_pos += bytes_consumed;
@@ -502,14 +428,9 @@ static char *transliterate_arabic_text(const char *input, int input_len, int *ou
         }
 
         /* Look up transliteration */
-        const char *translit = NULL;
-        int i;
-        for (i = 0; arabic_translit_table[i].ascii != NULL; i++) {
-            if (arabic_translit_table[i].unicode == codepoint) {
-                translit = arabic_translit_table[i].ascii;
-                break;
-            }
-        }
+        const char *translit = translit_lookup(
+                arabic_translit_table, TRANSLIT_COUNT(arabic_translit_table),
+                codepoint);
 
         if (translit && strlen(translit) > 0) {
             int len = strlen(translit);
@@ -555,7 +476,7 @@ static char *transliterate_text(const char *input, int input_len, int *output_le
 
     while (input_pos < input_len) {
         int bytes_consumed;
-        int codepoint = get_unicode_codepoint(input + input_pos, &bytes_consumed);
+        int codepoint = get_unicode_codepoint(input + input_pos, input_len - input_pos, &bytes_consumed);
 
         if (codepoint == -1) {
             input_pos++;
@@ -569,15 +490,8 @@ static char *transliterate_text(const char *input, int input_len, int *output_le
             continue;
         }
 
-        /* Look up in Latin diacritics table */
-        const char *translit = NULL;
-        int i;
-
-        /* Latin diacritics */
-        static struct {
-            int unicode;
-            const char *ascii;
-        } latin_table[] = {
+        /* Latin diacritics, sorted by codepoint for translit_lookup() */
+        static const translit_pair latin_table[] = {
                 {0x00C0, "A"},
                 {0x00C1, "A"},
                 {0x00C2, "A"},
@@ -763,17 +677,27 @@ static char *transliterate_text(const char *input, int input_len, int *output_le
                 {0x017C, "z"},
                 {0x017D, "Z"},
                 {0x017E, "z"},
+                /* Dotted consonants used in scholarly Arabic transliteration
+                ** (ḍ ḥ ḳ ṭ ẓ …) — without these the letter is dropped
+                ** entirely and e.g. ʿAẓīm folds to "aim" instead of "azim". */
+                {0x1E0C, "D"},
+                {0x1E0D, "d"},
+                {0x1E24, "H"},
+                {0x1E25, "h"},
+                {0x1E32, "K"},
+                {0x1E33, "k"},
                 {0x1E62, "S"},
                 {0x1E63, "s"},
+                {0x1E6C, "T"},
+                {0x1E6D, "t"},
+                {0x1E92, "Z"},
+                {0x1E93, "z"},
+                {0x1E96, "h"},
                 {0,      NULL}
         };
 
-        for (i = 0; latin_table[i].ascii != NULL; i++) {
-            if (latin_table[i].unicode == codepoint) {
-                translit = latin_table[i].ascii;
-                break;
-            }
-        }
+        const char *translit = translit_lookup(
+                latin_table, TRANSLIT_COUNT(latin_table), codepoint);
 
         if (translit) {
             int len = strlen(translit);
@@ -794,9 +718,6 @@ static char *transliterate_text(const char *input, int input_len, int *output_le
 /*
 ** Check if character is a word separator
 */
-/*
-** Check if character is a word separator
-*/
 static int is_word_separator(int codepoint) {
     /* ASCII whitespace and punctuation */
     if (codepoint < 128) {
@@ -813,7 +734,7 @@ static int is_word_separator(int codepoint) {
 
     /* Arabic punctuation */
     if (codepoint >= 0x060C && codepoint <= 0x061F) return 1; /* Arabic comma to question mark */
-    if (codepoint >= 0x06D4 && codepoint <= 0x06D4) return 1; /* Arabic full stop */
+    if (codepoint == 0x06D4) return 1; /* Arabic full stop */
 
     /* Arabic-specific separators */
     if (codepoint == 0x0020) return 1; /* Regular space */
@@ -824,107 +745,227 @@ static int is_word_separator(int codepoint) {
     if (codepoint >= 0x2010 && codepoint <= 0x2027) return 1;
     if (codepoint >= 0x2030 && codepoint <= 0x205E) return 1;
 
+    /* CJK punctuation (、。〈〉「」…) — without these, unsegmented Chinese
+    ** text fuses into single tokens spanning whole paragraphs (observed:
+    ** 522-char tokens). 0x3005 々 (iteration mark) and 0x3007 〇
+    ** (ideographic zero) are word-forming and stay part of tokens. */
+    if (codepoint >= 0x3001 && codepoint <= 0x303F &&
+        codepoint != 0x3005 && codepoint != 0x3007) return 1;
+
+    /* Fullwidth ASCII punctuation （！？：…）; fullwidth alphanumerics are
+    ** intentionally not separators. */
+    if (codepoint >= 0xFF01 && codepoint <= 0xFF0F) return 1;
+    if (codepoint >= 0xFF1A && codepoint <= 0xFF20) return 1;
+    if (codepoint >= 0xFF3B && codepoint <= 0xFF40) return 1;
+    if (codepoint >= 0xFF5B && codepoint <= 0xFF65) return 1;
+
     return 0;
 }
 
 /*
-** Generate trigrams for a word
+** Number of UTF-8 characters in a byte range.
 */
-static int emit_trigrams(const char *word, int word_len,
-                         void *pCtx, int start, int end,
-                         int (*xToken)(void *, int, const char *, int, int, int)) {
-    if (word_len < 3) {
-        /* For words shorter than 3 characters, emit as-is */
-        return xToken(pCtx, 1, word, word_len, start, end);
-    }
-
-    /* Generate overlapping trigrams */
-    int i;
-    for (i = 0; i <= word_len - 3; i++) {
-        int rc = xToken(pCtx, 1, word + i, 3, start, end);
-        if (rc != SQLITE_OK) return rc;
-    }
-
-    return SQLITE_OK;
-}
-
-static int emit_trigrams_arabic(const char *word, int word_len,
-                                void *pCtx, int start, int end,
-                                int (*xToken)(void *, int, const char *, int, int, int)) {
-    // Count characters and store byte positions
-    int char_positions[256];  // byte offset for each character
-    int char_count = 0;
-    int i = 0;
-
-    while (i < word_len && char_count < 255) {
-        char_positions[char_count++] = i;
+static int utf8_char_count(const char *word, int word_len) {
+    int pos = 0, count = 0;
+    while (pos < word_len) {
         int bytes;
-        get_unicode_codepoint(word + i, &bytes);
-        i += bytes;
+        get_unicode_codepoint(word + pos, word_len - pos, &bytes);
+        pos += (bytes > 0) ? bytes : 1;
+        count++;
     }
-    char_positions[char_count] = word_len;  // end marker
-
-    if (char_count < 3) {
-        return xToken(pCtx, 1, word, word_len, start, end);
-    }
-
-    // Emit 3-character trigrams
-    for (i = 0; i <= char_count - 3; i++) {
-        int trigram_start = char_positions[i];
-        int trigram_end = char_positions[i + 3];
-        int trigram_len = trigram_end - trigram_start;
-
-        int rc = xToken(pCtx, 1, word + trigram_start, trigram_len, start, end);
-        if (rc != SQLITE_OK) return rc;
-    }
-
-    return SQLITE_OK;
+    return count;
 }
 
 /*
-** Apply phonetic patterns (salah -> salat, etc.)
+** Emit character n-grams (n = nmin..nmax) as colocated tokens.
+** Works on UTF-8 characters, not bytes, and handles arbitrarily long words
+** (CJK clause runs) with a small sliding window of character offsets.
 */
-static int generate_phonetic_hash(const char *word, int word_len,
-                                  void *pCtx, int start, int end,
-                                  int (*xToken)(void *, int, const char *, int, int, int),
-                                  int flags, char *text, int case_sensitive) {
+static int emit_ngrams_unicode(const char *word, int word_len, int nmin, int nmax,
+                               void *pCtx, int start, int end,
+                               int (*xToken)(void *, int, const char *, int, int, int)) {
+    int ring[4];       /* byte offsets of the last <=4 char starts (nmax <= 3) */
+    int char_count = 0;
+    int pos = 0;
     int rc = SQLITE_OK;
 
-    // Lowercase the word before generating hash if case-insensitive
-    char *input_word = (char *)word;
-    char *lowered = NULL;
+    if (nmax > 3) nmax = 3;
+    if (nmin < 2) nmin = 2;
 
-    if (!case_sensitive) {
-        lowered = sqlite3_malloc(word_len + 1);
-        if (lowered) {
-            memcpy(lowered, word, word_len);
-            lowered[word_len] = '\0';
-            lowercase_ascii(lowered, word_len);
-            input_word = lowered;
+    while (pos < word_len && rc == SQLITE_OK) {
+        int bytes;
+        get_unicode_codepoint(word + pos, word_len - pos, &bytes);
+        if (bytes < 1) bytes = 1;
+        ring[char_count & 3] = pos;
+        char_count++;
+        pos += bytes;  /* pos is now the byte end of character (char_count-1) */
+
+        for (int n = nmin; n <= nmax && rc == SQLITE_OK; n++) {
+            if (char_count >= n) {
+                int from = ring[(char_count - n) & 3];
+                rc = xToken(pCtx, FTS5_TOKEN_COLOCATED, word + from, pos - from, start, end);
+            }
         }
     }
-
-    unsigned char *generated_hash = phonetic_hash((const unsigned char *)input_word, word_len);
-
-    if (lowered) sqlite3_free(lowered);
-
-    if (generated_hash == NULL) {
-        return SQLITE_IOERR_NOMEM;
-    }
-
-    // Calculate the length of the generated hash
-    int hash_length = strlen((const char *) generated_hash);
-
-    // Call the xToken function with the generated hash
-    int result = xToken(pCtx, flags, (const char *) generated_hash, hash_length, start, end);
-
-    // Clean up allocated memory
-    sqlite3_free(generated_hash);
-
-    return result;
+    return rc;
 }
 
+/*
+** Emit trigrams for an Arabic word — byte-compatible with the 0.0.x output:
+** overlapping 3-character grams; words shorter than 3 characters are emitted
+** whole (as a colocated duplicate of the primary), exactly as before.
+*/
+static int emit_trigrams_arabic_compat(const char *word, int word_len,
+                                       void *pCtx, int start, int end,
+                                       int (*xToken)(void *, int, const char *, int, int, int)) {
+    if (utf8_char_count(word, word_len) < 3) {
+        return xToken(pCtx, FTS5_TOKEN_COLOCATED, word, word_len, start, end);
+    }
+    return emit_ngrams_unicode(word, word_len, 3, 3, pCtx, start, end, xToken);
+}
 
+/*
+** Normalize a Latin/ASCII token into its fuzzy-match form.
+**
+** MUST stay byte-identical to normalize_latin() in the backend's
+** tools/search-qa/qa_common.py — both sides of the index depend on it.
+** Rules: lowercase; drop apostrophes and hyphens; map ee->i, oo->u, ou->u,
+** q->k; collapse runs of the same character.
+**
+** Chosen over the retired spellfix phonetic hash: measured on the full
+** 17-language fleet vocabulary it collides 1-9% of words (vs 41-76%), and
+** the collisions are variant spellings of the same word (salaam/salam).
+** Output length is always <= input length. Returns the output length.
+*/
+static int normalize_latin_ascii(const char *in, int n, char *out) {
+    int i = 0, o = 0;
+
+    while (i < n) {
+        char c = in[i];
+        if (c >= 'A' && c <= 'Z') c += 32;
+
+        if (c == '\'' || c == '-') {
+            i++;
+            continue;
+        }
+
+        char next = 0;
+        if (i + 1 < n) {
+            next = in[i + 1];
+            if (next >= 'A' && next <= 'Z') next += 32;
+        }
+
+        if (c == 'e' && next == 'e') { c = 'i'; i += 2; }
+        else if (c == 'o' && next == 'o') { c = 'u'; i += 2; }
+        else if (c == 'o' && next == 'u') { c = 'u'; i += 2; }
+        else if (c == 'q') { c = 'k'; i += 1; }
+        else { i += 1; }
+
+        if (o == 0 || out[o - 1] != c) {  /* collapse repeats */
+            out[o++] = c;
+        }
+    }
+    out[o] = '\0';
+    return o;
+}
+
+/*
+** Emit the normalized form of an ASCII token as a colocated synonym,
+** skipping the emission when normalization is a no-op.
+*/
+static int emit_normalized(const char *token, int token_len,
+                           void *pCtx, int start, int end,
+                           int (*xToken)(void *, int, const char *, int, int, int)) {
+    int rc = SQLITE_OK;
+    char *norm = sqlite3_malloc(token_len + 1);
+    if (!norm) return SQLITE_NOMEM;
+
+    int norm_len = normalize_latin_ascii(token, token_len, norm);
+    if (norm_len > 0 &&
+        (norm_len != token_len || memcmp(token, norm, token_len) != 0)) {
+        rc = xToken(pCtx, FTS5_TOKEN_COLOCATED, norm, norm_len, start, end);
+    }
+    sqlite3_free(norm);
+    return rc;
+}
+
+/*
+** Canonical form of Persian/Urdu letter variants and Arabic-Indic digits.
+**
+** Quranic/Arabic content uses Arabic codepoints while fa/ps/ur keyboards and
+** translations use Persian/Urdu variants — visually near-identical, different
+** bytes. Measured on the production DBs: 65% of Urdu, 32% of Farsi and 17%
+** of Pashto words contain variant codepoints, so cross-variant queries miss
+** without this mapping. Letter targets are the canonical classes that
+** remove_diacritic() already produces (yeh -> ى, heh -> ة).
+**
+** Returns the canonical codepoint, or the input codepoint unchanged.
+*/
+static int arabic_variant_canonical(int cp) {
+    switch (cp) {
+        case 0x06A9: return 0x0643;  /* ک keheh          -> ك kaf */
+        case 0x06CC: return 0x0649;  /* ی farsi yeh      -> ى (yeh class) */
+        case 0x06D2: return 0x0649;  /* ے yeh barree     -> ى */
+        case 0x06C1: return 0x0629;  /* ہ heh goal       -> ة (heh class) */
+        case 0x06BE: return 0x0629;  /* ھ heh doachashmee-> ة */
+        case 0x06C3: return 0x0629;  /* ۃ teh marbuta goal -> ة */
+        case 0x06BA: return 0x0646;  /* ں noon ghunna    -> ن noon */
+        default: break;
+    }
+    if (cp >= 0x0660 && cp <= 0x0669) return '0' + (cp - 0x0660);  /* ٠-٩ */
+    if (cp >= 0x06F0 && cp <= 0x06F9) return '0' + (cp - 0x06F0);  /* ۰-۹ */
+    return cp;
+}
+
+/*
+** Rewrite an Arabic-script word with variant letters/digits canonicalized.
+** Returns an sqlite3_malloc'd string when something changed, NULL when the
+** word is already canonical (the common case for pure Arabic content).
+** Canonical output is never longer than the input: 2-byte variants map to
+** 2-byte letters or 1-byte ASCII digits.
+*/
+static char *arabic_canonicalize(const char *in, int len, int *out_len) {
+    char *out = sqlite3_malloc(len + 1);
+    int changed = 0, i = 0, o = 0;
+
+    if (!out) {
+        *out_len = 0;
+        return NULL;
+    }
+
+    while (i < len) {
+        int l;
+        int cp = get_unicode_codepoint(in + i, len - i, &l);
+        if (cp < 0) {
+            out[o++] = in[i];
+            i++;
+            continue;
+        }
+
+        int canon = arabic_variant_canonical(cp);
+        if (canon == cp) {
+            for (int k = 0; k < l; k++) out[o++] = in[i + k];
+        } else if (canon < 0x80) {
+            changed = 1;
+            out[o++] = (char) canon;
+        } else {
+            /* All canonical letter targets are 2-byte codepoints (< U+0800) */
+            changed = 1;
+            out[o++] = (char) (0xC0 | (canon >> 6));
+            out[o++] = (char) (0x80 | (canon & 0x3F));
+        }
+        i += l;
+    }
+
+    if (!changed) {
+        sqlite3_free(out);
+        *out_len = 0;
+        return NULL;
+    }
+    out[o] = '\0';
+    *out_len = o;
+    return out;
+}
 
 /*
 ** FTS5 tokenizer interface implementation
@@ -952,7 +993,7 @@ static int arabic_phonetic_fuzzy_trigram_create(
     pNew->bRemoveDiacritics = 1;
     pNew->bGenerateTrigrams = 1;
     pNew->bTransliterate = 1;
-    pNew->bGeneratePhonetic = 1;
+    pNew->bGenerateNormalized = 1;
     pNew->bCaseSensitive = 0;
 
     /* Parse arguments */
@@ -966,8 +1007,14 @@ static int arabic_phonetic_fuzzy_trigram_create(
         } else if (strcmp(azArg[i], "transliterate") == 0 && i + 1 < nArg) {
             pNew->bTransliterate = atoi(azArg[i + 1]);
             i++;
+        } else if (strcmp(azArg[i], "generate_normalized") == 0 && i + 1 < nArg) {
+            pNew->bGenerateNormalized = atoi(azArg[i + 1]);
+            i++;
         } else if (strcmp(azArg[i], "generate_phonetic") == 0 && i + 1 < nArg) {
-            pNew->bGeneratePhonetic = atoi(azArg[i + 1]);
+            /* DEPRECATED and ignored. The spellfix-derived hash collided
+            ** unrelated words across languages (41-76% of vocabulary); it is
+            ** superseded by generate_normalized. The argument is still
+            ** accepted because existing DB schemas contain it. */
             i++;
         } else if (strcmp(azArg[i], "case_sensitive") == 0 && i + 1 < nArg) {
             pNew->bCaseSensitive = atoi(azArg[i + 1]);
@@ -987,6 +1034,130 @@ static void arabic_phonetic_fuzzy_trigram_delete(Fts5Tokenizer *pTokenizer) {
 }
 
 /*
+** Process a single word: emit its primary token and colocated fuzzy tokens.
+**
+** Primary-token contract (compatibility across tokenizer versions):
+**   Arabic word  -> diacritic-stripped word (when remove_diacritics)
+**   other word   -> ASCII-lowercased word (unless case_sensitive)
+** These must never change: they are what old indexes and new queries agree on.
+*/
+static int process_word(arabic_phonetic_fuzzy_trigram_tokenizer *pTok,
+                        void *pCtx, const char *token, int token_len,
+                        int token_start, int token_end,
+                        int (*xToken)(void *, int, const char *, int, int, int)) {
+    int rc = SQLITE_OK;
+
+    if (is_arabic_word(token, token_len) && pTok->bRemoveDiacritics) {
+        /* ---- Arabic word ---- */
+        int clean_len;
+        char *clean = remove_diacritic(token, token_len, &clean_len);
+        if (clean && clean_len > 0) {
+            rc = xToken(pCtx, 0, clean, clean_len, token_start, token_end);  /* PRIMARY */
+
+            if (rc == SQLITE_OK && pTok->bGenerateTrigrams) {
+                rc = emit_trigrams_arabic_compat(clean, clean_len, pCtx,
+                                                 token_start, token_end, xToken);
+            }
+
+            /* Persian/Urdu variant + Arabic-Indic digit canonicalization,
+            ** as a colocated synonym. Trigrams of the canonical form are
+            ** emitted too so partial-word matches also bridge variants. */
+            if (rc == SQLITE_OK && pTok->bGenerateNormalized) {
+                int canon_len;
+                char *canon = arabic_canonicalize(clean, clean_len, &canon_len);
+                if (canon) {
+                    rc = xToken(pCtx, FTS5_TOKEN_COLOCATED, canon, canon_len,
+                                token_start, token_end);
+                    if (rc == SQLITE_OK && pTok->bGenerateTrigrams) {
+                        rc = emit_trigrams_arabic_compat(canon, canon_len, pCtx,
+                                                         token_start, token_end,
+                                                         xToken);
+                    }
+                    sqlite3_free(canon);
+                }
+            }
+        }
+        if (clean) sqlite3_free(clean);
+
+        /* Transliteration — for every Arabic word. (0.0.x required the word
+        ** to carry diacritics, which made undiacritized titles invisible to
+        ** Latin queries.) */
+        if (rc == SQLITE_OK && pTok->bTransliterate) {
+            int translit_len;
+            char *translit = transliterate_text(token, token_len, &translit_len);
+            if (translit && translit_len > 0) {
+                if (!pTok->bCaseSensitive) {
+                    lowercase_ascii(translit, translit_len);
+                }
+                rc = xToken(pCtx, FTS5_TOKEN_COLOCATED, translit, translit_len,
+                            token_start, token_end);
+
+                if (rc == SQLITE_OK && pTok->bGenerateNormalized) {
+                    rc = emit_normalized(translit, translit_len, pCtx,
+                                         token_start, token_end, xToken);
+                }
+            }
+            if (translit) sqlite3_free(translit);
+        }
+        return rc;
+    }
+
+    /* ---- Non-Arabic word ---- */
+    char *lowered = sqlite3_malloc(token_len + 1);
+    if (!lowered) return SQLITE_NOMEM;
+    memcpy(lowered, token, token_len);
+    lowered[token_len] = '\0';
+    if (!pTok->bCaseSensitive) {
+        lowercase_ascii(lowered, token_len);
+    }
+
+    rc = xToken(pCtx, 0, lowered, token_len, token_start, token_end);  /* PRIMARY */
+
+    if (rc == SQLITE_OK && is_all_ascii(token, token_len)) {
+        /* Latin/ASCII: the normalized form is the fuzzy token. Character
+        ** n-grams are deliberately NOT emitted for ASCII words — they would
+        ** make every 3-letter fragment of every word a match and destroy
+        ** precision; normalization covers the observed error classes
+        ** (doubled letters, vowel-length variants, apostrophes). */
+        if (pTok->bGenerateNormalized) {
+            rc = emit_normalized(lowered, token_len, pCtx,
+                                 token_start, token_end, xToken);
+        }
+    } else if (rc == SQLITE_OK) {
+        /* Other scripts (Bengali, Devanagari, Gujarati, CJK, ...): char
+        ** n-grams give typo tolerance and substring matching. CJK also gets
+        ** bigrams: most Chinese words are two characters. */
+        if (pTok->bGenerateTrigrams) {
+            int nmin = contains_cjk(token, token_len) ? 2 : 3;
+            rc = emit_ngrams_unicode(lowered, token_len, nmin, 3, pCtx,
+                                     token_start, token_end, xToken);
+        }
+
+        /* Latin-diacritic folding (é -> e, ü -> u, ...) */
+        if (rc == SQLITE_OK && pTok->bTransliterate) {
+            int translit_len;
+            char *translit = transliterate_text(token, token_len, &translit_len);
+            if (translit && translit_len > 0 &&
+                (translit_len != token_len || memcmp(token, translit, token_len) != 0)) {
+                if (!pTok->bCaseSensitive) {
+                    lowercase_ascii(translit, translit_len);
+                }
+                rc = xToken(pCtx, FTS5_TOKEN_COLOCATED, translit, translit_len,
+                            token_start, token_end);
+                if (rc == SQLITE_OK && pTok->bGenerateNormalized) {
+                    rc = emit_normalized(translit, translit_len, pCtx,
+                                         token_start, token_end, xToken);
+                }
+            }
+            if (translit) sqlite3_free(translit);
+        }
+    }
+
+    sqlite3_free(lowered);
+    return rc;
+}
+
+/*
 ** Main tokenization function
 */
 static int arabic_phonetic_fuzzy_trigram_tokenize(
@@ -1001,11 +1172,11 @@ static int arabic_phonetic_fuzzy_trigram_tokenize(
     int pos = 0;
     int token_start = 0;
 
-    (void) flags;
+    (void) flags;  /* emission is symmetric for documents and queries */
 
     while (pos < nText && rc == SQLITE_OK) {
         int bytes_consumed;
-        int codepoint = get_unicode_codepoint(pText + pos, &bytes_consumed);
+        int codepoint = get_unicode_codepoint(pText + pos, nText - pos, &bytes_consumed);
 
         if (codepoint == -1) {
             pos++;
@@ -1013,94 +1184,15 @@ static int arabic_phonetic_fuzzy_trigram_tokenize(
         }
 
         if (is_word_separator(codepoint)) {
-            /* End of token */
             if (pos > token_start) {
-                const char *token = pText + token_start;
-                int token_len = pos - token_start;
-
-                if (is_arabic_word(token, token_len) && pTok->bRemoveDiacritics) {
-                    int clean_len;
-                    char *clean = remove_diacritic(token, token_len, &clean_len);
-                    if (clean && clean_len > 0) {
-                        //  printf("PRIMARY Arabic token: '%.*s' hex: ", clean_len, clean);
-                        //  for(int k = 0; k < clean_len; k++) printf("%02x ", (unsigned char)clean[k]);
-                        //   printf("\n");
-                        rc = xToken(pCtx, 0, clean, clean_len, token_start, pos);  // PRIMARY
-//                        if (rc == SQLITE_OK) {
-//                            rc = generate_phonetic_hash(clean, clean_len, pCtx, token_start, pos, xToken, 1, "remove_diacritic");
-//                        }
-                        if (rc == SQLITE_OK && pTok->bGenerateTrigrams) {
-                            if (is_arabic_word(clean, clean_len)) {
-                                rc = emit_trigrams_arabic(clean, clean_len, pCtx, token_start, pos, xToken);
-                            } else {
-                                rc = emit_trigrams(clean, clean_len, pCtx, token_start, pos, xToken);
-                            }
-                        }
-                    }
-                    if (clean) sqlite3_free(clean);
-                } else {
-                    // Non-Arabic: check if we should generate phonetic hash
-                    if (pTok->bGeneratePhonetic) {
-                        rc = generate_phonetic_hash(token, token_len, pCtx, token_start, pos, xToken, 0, "default", pTok->bCaseSensitive);
-                    } else {
-                        // If phonetic is disabled, emit the raw token as primary
-                        if (!pTok->bCaseSensitive) {
-                            // Lowercase for case-insensitive matching
-                            char *lowered = sqlite3_malloc(token_len + 1);
-                            if (lowered) {
-                                memcpy(lowered, token, token_len);
-                                lowered[token_len] = '\0';
-                                lowercase_ascii(lowered, token_len);
-                                rc = xToken(pCtx, 0, lowered, token_len, token_start, pos);
-                                sqlite3_free(lowered);
-                            } else {
-                                rc = SQLITE_NOMEM;
-                            }
-                        } else {
-                            // Case-sensitive: emit as-is
-                            rc = xToken(pCtx, 0, token, token_len, token_start, pos);
-                        }
-                    }
-                }
-
-
-
-                //  printf("word '%.*s'\n\n", token_len, token);
-                /* Transliterate if enabled */
-                /* Transliterate if enabled */
-                if (rc == SQLITE_OK && pTok->bTransliterate &&
-                    (!is_arabic_word(token, token_len) || has_diacritics(token, token_len))) {
-                    int translit_len;
-                    char *translit = transliterate_text(token, token_len, &translit_len);
-                    if (translit && translit_len > 0 &&
-                        (translit_len != token_len || memcmp(token, translit, token_len) != 0)) {
-
-                        // Lowercase transliterated text if case-insensitive
-                        if (!pTok->bCaseSensitive) {
-                            lowercase_ascii(translit, translit_len);
-                        }
-
-                        rc = xToken(pCtx, 1, translit, translit_len, token_start, pos);
-
-                        /* Apply phonetic patterns to transliterated text */
-                        if (rc == SQLITE_OK && pTok->bGeneratePhonetic) {
-                            rc = generate_phonetic_hash(translit, translit_len, pCtx, token_start, pos, xToken, 1,
-                                                        "translit", pTok->bCaseSensitive);
-                        }
-
-                        /* Generate trigrams for transliterated text */
-                        if (rc == SQLITE_OK && pTok->bGenerateTrigrams) {
-                            rc = emit_trigrams(translit, translit_len, pCtx, token_start, pos, xToken);
-                        }
-                    }
-                    if (translit) sqlite3_free(translit);
-                }
+                rc = process_word(pTok, pCtx, pText + token_start, pos - token_start,
+                                  token_start, pos, xToken);
             }
 
-            /* Skip whitespace */
+            /* Skip separators */
             while (pos < nText) {
                 int next_bytes;
-                int next_codepoint = get_unicode_codepoint(pText + pos, &next_bytes);
+                int next_codepoint = get_unicode_codepoint(pText + pos, nText - pos, &next_bytes);
                 if (next_codepoint == -1 || !is_word_separator(next_codepoint)) break;
                 pos += next_bytes;
             }
@@ -1111,86 +1203,10 @@ static int arabic_phonetic_fuzzy_trigram_tokenize(
         pos += bytes_consumed;
     }
 
-    /* Handle final token */
+    /* Final token */
     if (pos > token_start && rc == SQLITE_OK) {
-        const char *token = pText + token_start;
-        int token_len = pos - token_start;
-
-        /* Same processing as above for final token */
-        if (is_arabic_word(token, token_len) && pTok->bRemoveDiacritics) {
-            int clean_len;
-            char *clean = remove_diacritic(token, token_len, &clean_len);
-            if (clean && clean_len > 0) {
-                // printf("PRIMARY Arabic token: '%.*s' hex: ", clean_len, clean);
-                //   for(int k = 0; k < clean_len; k++) printf("%02x ", (unsigned char)clean[k]);
-                //    printf("\n");
-                rc = xToken(pCtx, 0, clean, clean_len, token_start, pos);  // PRIMARY
-//                if (rc == SQLITE_OK) {
-//                    rc = generate_phonetic_hash(clean, clean_len, pCtx, token_start, pos, xToken, 1, "remove_diacritic");
-//                }
-                if (rc == SQLITE_OK && pTok->bGenerateTrigrams) {
-                    if (is_arabic_word(clean, clean_len)) {
-                        rc = emit_trigrams_arabic(clean, clean_len, pCtx, token_start, pos, xToken);
-                    } else {
-                        rc = emit_trigrams(clean, clean_len, pCtx, token_start, pos, xToken);
-                    }
-                }
-            }
-            if (clean) sqlite3_free(clean);
-        } else {
-            // Non-Arabic: check if we should generate phonetic hash
-            if (pTok->bGeneratePhonetic) {
-                rc = generate_phonetic_hash(token, token_len, pCtx, token_start, pos, xToken, 0, "default", pTok->bCaseSensitive);
-            } else {
-                // If phonetic is disabled, emit the raw token as primary
-                if (!pTok->bCaseSensitive) {
-                    // Lowercase for case-insensitive matching
-                    char *lowered = sqlite3_malloc(token_len + 1);
-                    if (lowered) {
-                        memcpy(lowered, token, token_len);
-                        lowered[token_len] = '\0';
-                        lowercase_ascii(lowered, token_len);
-                        rc = xToken(pCtx, 0, lowered, token_len, token_start, pos);
-                        sqlite3_free(lowered);
-                    } else {
-                        rc = SQLITE_NOMEM;
-                    }
-                } else {
-                    // Case-sensitive: emit as-is
-                    rc = xToken(pCtx, 0, token, token_len, token_start, pos);
-                }
-            }
-        }
-
-        //  printf("word '%.*s'\n\n", token_len, token);
-        /* Transliterate if enabled */
-        if (rc == SQLITE_OK && pTok->bTransliterate &&
-            (!is_arabic_word(token, token_len) || has_diacritics(token, token_len))) {
-            int translit_len;
-            char *translit = transliterate_text(token, token_len, &translit_len);
-            if (translit && translit_len > 0 &&
-                (translit_len != token_len || memcmp(token, translit, token_len) != 0)) {
-
-                // Lowercase transliterated text if case-insensitive
-                if (!pTok->bCaseSensitive) {
-                    lowercase_ascii(translit, translit_len);
-                }
-
-                rc = xToken(pCtx, 1, translit, translit_len, token_start, pos);
-
-                /* Apply phonetic patterns to transliterated text */
-                if (rc == SQLITE_OK && pTok->bGeneratePhonetic) {
-                    rc = generate_phonetic_hash(translit, translit_len, pCtx, token_start, pos, xToken, 1,
-                                                "translit", pTok->bCaseSensitive);
-                }
-
-                /* Generate trigrams for transliterated text */
-                if (rc == SQLITE_OK && pTok->bGenerateTrigrams) {
-                    rc = emit_trigrams(translit, translit_len, pCtx, token_start, pos, xToken);
-                }
-            }
-            if (translit) sqlite3_free(translit);
-        }
+        rc = process_word(pTok, pCtx, pText + token_start, pos - token_start,
+                          token_start, pos, xToken);
     }
 
     return rc;
@@ -1204,6 +1220,288 @@ static fts5_tokenizer arabic_phonetic_fuzzy_trigram_tokenizer_module = {
         arabic_phonetic_fuzzy_trigram_delete,
         arabic_phonetic_fuzzy_trigram_tokenize
 };
+
+/*
+** SELECT arabic_phonetic_fuzzy_trigram_tokens(text [, config]) -> JSON
+**
+** Debug/QA introspection: returns the emitted token stream as a JSON array
+** of [token, colocated] pairs, e.g.
+**
+**   SELECT arabic_phonetic_fuzzy_trigram_tokens('Subhaanallaahi');
+**   -- [["subhaanallaahi",0],["subhanalahi",1]]
+**
+** colocated=0 is the primary token, colocated=1 an FTS5 synonym. The
+** optional second argument is a tokenizer argument string; pass the exact
+** args from a table's tokenize= clause (the leading tokenizer name is
+** allowed and skipped) to reproduce that table's emission. Without it,
+** defaults apply.
+*/
+typedef struct TokensDumpCtx {
+    sqlite3_str *pStr;
+    int nTok;
+} TokensDumpCtx;
+
+static int tokens_dump_callback(void *pCtx, int tflags,
+                                const char *pToken, int nToken,
+                                int iStart, int iEnd) {
+    TokensDumpCtx *p = (TokensDumpCtx *) pCtx;
+    (void) iStart;
+    (void) iEnd;
+
+    sqlite3_str_appendall(p->pStr, p->nTok ? ",[\"" : "[\"");
+    for (int i = 0; i < nToken; i++) {
+        unsigned char c = (unsigned char) pToken[i];
+        if (c == '"' || c == '\\') {
+            sqlite3_str_appendchar(p->pStr, 1, '\\');
+            sqlite3_str_appendchar(p->pStr, 1, (char) c);
+        } else if (c < 0x20) {
+            sqlite3_str_appendf(p->pStr, "\\u%04x", (int) c);
+        } else {
+            sqlite3_str_appendchar(p->pStr, 1, (char) c);
+        }
+    }
+    sqlite3_str_appendf(p->pStr, "\",%d]",
+                        (tflags & FTS5_TOKEN_COLOCATED) ? 1 : 0);
+    p->nTok++;
+    return SQLITE_OK;
+}
+
+static void arabic_phonetic_fuzzy_trigram_tokens_func(
+        sqlite3_context *pCtx, int nArg, sqlite3_value **apArg) {
+    const char *zText = (const char *) sqlite3_value_text(apArg[0]);
+    int nText = sqlite3_value_bytes(apArg[0]);
+    const char *azArg[32];
+    int nTokArg = 0;
+    char *zConfig = 0;
+    const char **azUse = azArg;
+    Fts5Tokenizer *pTok = 0;
+    TokensDumpCtx ctx;
+    char *zOut;
+
+    if (!zText) {
+        sqlite3_result_null(pCtx);
+        return;
+    }
+
+    if (nArg == 2 && sqlite3_value_text(apArg[1])) {
+        zConfig = sqlite3_mprintf("%s", sqlite3_value_text(apArg[1]));
+        if (!zConfig) {
+            sqlite3_result_error_nomem(pCtx);
+            return;
+        }
+        char *z = zConfig;
+        while (*z && nTokArg < 32) {
+            while (*z == ' ') *z++ = '\0';
+            if (*z) {
+                azArg[nTokArg++] = z;
+                while (*z && *z != ' ') z++;
+            }
+        }
+        /* Allow passing the whole tokenize= string: skip the leading name */
+        if (nTokArg > 0 &&
+            strcmp(azArg[0], "arabic_phonetic_fuzzy_trigram") == 0) {
+            azUse = azArg + 1;
+            nTokArg--;
+        }
+    }
+
+    if (arabic_phonetic_fuzzy_trigram_create(0, azUse, nTokArg, &pTok) != SQLITE_OK) {
+        sqlite3_free(zConfig);
+        sqlite3_result_error_nomem(pCtx);
+        return;
+    }
+
+    ctx.pStr = sqlite3_str_new(sqlite3_context_db_handle(pCtx));
+    ctx.nTok = 0;
+    sqlite3_str_appendchar(ctx.pStr, 1, '[');
+    arabic_phonetic_fuzzy_trigram_tokenize(pTok, &ctx, 0, zText, nText,
+                                           tokens_dump_callback);
+    sqlite3_str_appendchar(ctx.pStr, 1, ']');
+
+    zOut = sqlite3_str_finish(ctx.pStr);
+    if (zOut) {
+        sqlite3_result_text(pCtx, zOut, -1, sqlite3_free);
+    } else {
+        sqlite3_result_error_nomem(pCtx);
+    }
+
+    arabic_phonetic_fuzzy_trigram_delete(pTok);
+    sqlite3_free(zConfig);
+}
+
+/*
+** SELECT arabic_phonetic_fuzzy_trigram_normalize(word) -> TEXT
+**
+** The universal search_vocab lookup-key transform, exposed to SQL so
+** consumers (the mobile app's typo-correction fallback, backend vocabulary
+** generation, QA tooling) never reimplement the rules — the C implementation
+** is the single source of truth. Routed by script:
+**
+**   ASCII/Latin   -> normalize_latin_ascii (lowercase, drop '/-,
+**                    ee->i oo->u ou->u q->k, collapse doubles)
+**   Arabic script -> remove_diacritic + variant/digit canonicalization —
+**                    the same normalized space as the FTS primary tokens
+**   other scripts -> unchanged (Indic vocabulary keys are the raw words)
+*/
+static void arabic_phonetic_fuzzy_trigram_normalize_func(
+        sqlite3_context *pCtx, int nArg, sqlite3_value **apArg) {
+    const char *zIn = (const char *) sqlite3_value_text(apArg[0]);
+    (void) nArg;
+
+    if (!zIn) {
+        sqlite3_result_null(pCtx);
+        return;
+    }
+    int nIn = sqlite3_value_bytes(apArg[0]);
+
+    if (is_all_ascii(zIn, nIn)) {
+        char *zOut = sqlite3_malloc(nIn + 1);
+        if (!zOut) {
+            sqlite3_result_error_nomem(pCtx);
+            return;
+        }
+        int nOut = normalize_latin_ascii(zIn, nIn, zOut);
+        sqlite3_result_text(pCtx, zOut, nOut, sqlite3_free);
+        return;
+    }
+
+    if (is_arabic_word(zIn, nIn)) {
+        int nClean;
+        char *zClean = remove_diacritic(zIn, nIn, &nClean);
+        if (!zClean) {
+            sqlite3_result_error_nomem(pCtx);
+            return;
+        }
+        int nCanon;
+        char *zCanon = arabic_canonicalize(zClean, nClean, &nCanon);
+        if (zCanon) {
+            sqlite3_free(zClean);
+            sqlite3_result_text(pCtx, zCanon, nCanon, sqlite3_free);
+        } else {
+            sqlite3_result_text(pCtx, zClean, nClean, sqlite3_free);
+        }
+        return;
+    }
+
+    /* Other scripts (Bengali, Devanagari, Gujarati, ...): identity */
+    sqlite3_result_text(pCtx, zIn, nIn, SQLITE_TRANSIENT);
+}
+
+/*
+** SELECT arabic_phonetic_fuzzy_trigram_editdist(a, b [, maxd]) -> INTEGER
+**
+** Levenshtein edit distance between two strings, for query-time typo
+** correction against the `search_vocab` table that DB generation builds:
+**
+**   SELECT display FROM search_vocab
+**   WHERE arabic_phonetic_fuzzy_trigram_editdist(word, :q, 2) <= 2
+**   ORDER BY arabic_phonetic_fuzzy_trigram_editdist(word, :q, 2), rank DESC
+**   LIMIT 3;
+**
+** (:q is the user's word passed through normalize_latin — the vocab stores
+** normalized forms.)
+**
+** The optional third argument is a distance cap: rows abort as soon as the
+** running row-minimum exceeds it, returning 999. Most vocabulary words
+** diverge from a query within a few characters, so the capped form scans
+** ~3x faster (verified equivalent to the exact form for all results <= maxd
+** over 3M random pairs). Without maxd the exact distance is returned.
+**
+** Returns 999 when either string exceeds 63 bytes or the length difference
+** exceeds 8 (never useful correction candidates; keeps DP buffers on the
+** stack). NULL in, NULL out. Candidates are real corpus words, so unlike
+** hash-bucket matching a suggestion can never be an unrelated word.
+*/
+#define EDITDIST_MAX_WORD 64
+
+static void arabic_phonetic_fuzzy_trigram_editdist_func(
+        sqlite3_context *pCtx, int nArg, sqlite3_value **apArg) {
+    const unsigned char *a = sqlite3_value_text(apArg[0]);
+    const unsigned char *b = sqlite3_value_text(apArg[1]);
+
+    if (!a || !b) {
+        sqlite3_result_null(pCtx);
+        return;
+    }
+
+    int na_bytes = sqlite3_value_bytes(apArg[0]);
+    int nb_bytes = sqlite3_value_bytes(apArg[1]);
+    int maxd = -1;  /* -1: exact mode (no cap) */
+    if (nArg == 3) {
+        maxd = sqlite3_value_int(apArg[2]);
+        if (maxd < 0) maxd = 0;
+    }
+
+    /* Decode to codepoints: the DP must count CHARACTERS, not bytes.
+    ** Byte-level distance is an encoding artifact for multibyte scripts —
+    ** most Arabic letters share a lead byte, so some one-letter typos cost
+    ** 1 byte and others 2, and thresholds stop meaning "number of typos".
+    ** For pure-ASCII input this is byte-identical to the old behavior. */
+    int ca[EDITDIST_MAX_WORD], cb[EDITDIST_MAX_WORD];
+    int na = 0, nb = 0, pos = 0;
+    while (pos < na_bytes) {
+        int l;
+        int cp = get_unicode_codepoint((const char *) a + pos, na_bytes - pos, &l);
+        if (na >= EDITDIST_MAX_WORD) { sqlite3_result_int(pCtx, 999); return; }
+        ca[na++] = (cp < 0) ? (unsigned char) a[pos] : cp;
+        pos += (l > 0) ? l : 1;
+    }
+    pos = 0;
+    while (pos < nb_bytes) {
+        int l;
+        int cp = get_unicode_codepoint((const char *) b + pos, nb_bytes - pos, &l);
+        if (nb >= EDITDIST_MAX_WORD) { sqlite3_result_int(pCtx, 999); return; }
+        cb[nb++] = (cp < 0) ? (unsigned char) b[pos] : cp;
+        pos += (l > 0) ? l : 1;
+    }
+
+    if (na - nb > 8 || nb - na > 8 ||
+        (maxd >= 0 && (na - nb > maxd || nb - na > maxd))) {
+        sqlite3_result_int(pCtx, 999);
+        return;
+    }
+
+    int prev[EDITDIST_MAX_WORD + 1];
+    int cur[EDITDIST_MAX_WORD + 1];
+    for (int j = 0; j <= nb; j++) prev[j] = j;
+    for (int i = 1; i <= na; i++) {
+        cur[0] = i;
+        int rowmin = i;
+        for (int j = 1; j <= nb; j++) {
+            int m = prev[j] + 1;                          /* deletion */
+            if (cur[j - 1] + 1 < m) m = cur[j - 1] + 1;   /* insertion */
+            int cost = (ca[i - 1] != cb[j - 1]);
+            if (prev[j - 1] + cost < m) m = prev[j - 1] + cost;  /* subst */
+            cur[j] = m;
+            if (m < rowmin) rowmin = m;
+        }
+        if (maxd >= 0 && rowmin > maxd) {
+            /* No cell can decrease in later rows: distance > maxd, abort. */
+            sqlite3_result_int(pCtx, 999);
+            return;
+        }
+        memcpy(prev, cur, sizeof(int) * (nb + 1));
+    }
+    if (maxd >= 0 && prev[nb] > maxd) {
+        sqlite3_result_int(pCtx, 999);
+        return;
+    }
+    sqlite3_result_int(pCtx, prev[nb]);
+}
+
+/*
+** SELECT arabic_phonetic_fuzzy_trigram_version() -> '0.1.0'
+**
+** Lets any consumer (backend DB generation, the mobile app, QA tooling)
+** verify at runtime which tokenizer build is loaded. Builds prior to 0.1.0
+** do not provide this function ("no such function" identifies them).
+*/
+static void arabic_phonetic_fuzzy_trigram_version_func(
+        sqlite3_context *pCtx, int nArg, sqlite3_value **apArg) {
+    (void) nArg;
+    (void) apArg;
+    sqlite3_result_text(pCtx, ARABIC_PHONETIC_FUZZY_TRIGRAM_VERSION, -1, SQLITE_STATIC);
+}
 
 /*
 ** Register the tokenizer module
@@ -1230,6 +1528,58 @@ static int register_arabic_phonetic_fuzzy_trigram_tokenizer(sqlite3 *db) {
                                 (void *) pApi,
                                 &arabic_phonetic_fuzzy_trigram_tokenizer_module,
                                 NULL);
+    if (rc != SQLITE_OK) return rc;
+
+    /* Register the version function */
+    rc = sqlite3_create_function(db, "arabic_phonetic_fuzzy_trigram_version", 0,
+                                 SQLITE_UTF8 | SQLITE_DETERMINISTIC
+#ifdef SQLITE_INNOCUOUS
+            | SQLITE_INNOCUOUS
+#endif
+            , NULL,
+                                 arabic_phonetic_fuzzy_trigram_version_func,
+                                 NULL, NULL);
+    if (rc != SQLITE_OK) return rc;
+
+    /* Register the token-stream introspection function (1- and 2-arg) */
+    for (int nArg = 1; nArg <= 2 && rc == SQLITE_OK; nArg++) {
+        rc = sqlite3_create_function(db, "arabic_phonetic_fuzzy_trigram_tokens",
+                                     nArg,
+                                     SQLITE_UTF8 | SQLITE_DETERMINISTIC
+#ifdef SQLITE_INNOCUOUS
+                | SQLITE_INNOCUOUS
+#endif
+                , NULL,
+                                     arabic_phonetic_fuzzy_trigram_tokens_func,
+                                     NULL, NULL);
+    }
+    if (rc != SQLITE_OK) return rc;
+
+    /* Register the normalization function (single source of truth for the
+    ** search_vocab lookup-key format) */
+    rc = sqlite3_create_function(db, "arabic_phonetic_fuzzy_trigram_normalize", 1,
+                                 SQLITE_UTF8 | SQLITE_DETERMINISTIC
+#ifdef SQLITE_INNOCUOUS
+            | SQLITE_INNOCUOUS
+#endif
+            , NULL,
+                                 arabic_phonetic_fuzzy_trigram_normalize_func,
+                                 NULL, NULL);
+    if (rc != SQLITE_OK) return rc;
+
+    /* Register the edit-distance function (query-time typo correction):
+    ** 2-arg exact, 3-arg with distance cap + early abort. */
+    for (int nArg = 2; nArg <= 3 && rc == SQLITE_OK; nArg++) {
+        rc = sqlite3_create_function(db, "arabic_phonetic_fuzzy_trigram_editdist",
+                                     nArg,
+                                     SQLITE_UTF8 | SQLITE_DETERMINISTIC
+#ifdef SQLITE_INNOCUOUS
+                | SQLITE_INNOCUOUS
+#endif
+                , NULL,
+                                     arabic_phonetic_fuzzy_trigram_editdist_func,
+                                     NULL, NULL);
+    }
 
     return rc;
 }
